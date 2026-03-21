@@ -583,9 +583,27 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ══ Main ═════════════════════════════════════════════════════════════
 async def post_init(application):
-    """Delete any existing webhook to avoid conflicts."""
+    """Delete any existing webhook and register bot commands."""
     await application.bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Webhook deleted, polling mode ready.")
+
+    # Register commands so they appear as suggestions when user types "/"
+    from telegram import BotCommand
+    commands = [
+        BotCommand("morning", "تذكير الصبح - 3 screenshots"),
+        BotCommand("afternoon", "تذكير العصر - 2 screenshots"),
+        BotCommand("status", "حالة الفرق النهارده"),
+        BotCommand("alert", "إرسال تنبيه لفريق معين"),
+        BotCommand("broadcast", "إرسال رسالة لكل الفرق"),
+        BotCommand("team", "عرض حالة فريق"),
+        BotCommand("compare", "مقارنة تقرير الصبح والعصر"),
+        BotCommand("pause", "إيقاف تذكيرات لفريق"),
+        BotCommand("weekly", "طلب التقرير الأسبوعي"),
+        BotCommand("report", "ملخص يومي كامل"),
+        BotCommand("help", "قائمة الأوامر"),
+        BotCommand("start", "تشغيل البوت"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Webhook deleted, commands registered, polling mode ready.")
 
 
 def main():
