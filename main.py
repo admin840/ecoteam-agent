@@ -379,7 +379,6 @@ async def auto_afternoon_reminder(context: ContextTypes.DEFAULT_TYPE):
                 f"وصلني وشكراً 🙏:\n- {received_text} ✅\n\n"
                 f"لسه مستني:\n- {missing_text}")
         else:
-        else:
             sent_count += 1
             await send_to_group(context, gid, AFTERNOON_MSG)
 
