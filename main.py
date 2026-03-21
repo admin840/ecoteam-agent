@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from telegram import Update
@@ -194,6 +195,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("Screenshot received from group %s", update.effective_chat.id)
 
 
+async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle forwarded messages in private chat - reply with chat ID info."""
+    if update.effective_chat.type != "private":
+        return
+    msg = update.message
+    forward_chat = msg.forward_origin
+    if forward_chat:
+        # Try to get the original chat info
+        if hasattr(forward_chat, "sender_chat") and forward_chat.sender_chat:
+            fwd_info = f"{forward_chat.sender_chat.title} (ID: {forward_chat.sender_chat.id})"
+        elif hasattr(forward_chat, "chat") and forward_chat.chat:
+            fwd_info = f"{forward_chat.chat.title} (ID: {forward_chat.chat.id})"
+        else:
+            fwd_info = str(forward_chat)
+        await msg.reply_text(
+            f"Chat ID: {update.effective_chat.id}\n"
+            f"Forward from: {fwd_info}"
+        )
+    else:
+        await msg.reply_text(f"Chat ID: {update.effective_chat.id}")
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Track photo messages as screenshots."""
     if update.effective_chat.id in GROUP_IDS:
@@ -212,6 +235,9 @@ def main():
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
 
+    # Handle forwarded messages in private chat (to get chat IDs)
+    app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forwarded))
+
     # Track photos as screenshots
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -221,4 +247,5 @@ def main():
 
 
 if __name__ == "__main__":
+    asyncio.set_event_loop(asyncio.new_event_loop())
     main()
