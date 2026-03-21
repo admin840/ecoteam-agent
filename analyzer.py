@@ -333,19 +333,45 @@ async def fetch_team_sheet(team_name: str) -> list[dict]:
         return []
 
 
+def _parse_sheet_date(date_str: str):
+    """Parse date from team sheet (M/D/YYYY or similar formats)."""
+    if not date_str:
+        return None
+    date_str = str(date_str).strip()
+    import re
+    m = re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})', date_str)
+    if m:
+        try:
+            month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return datetime(year, month, day)
+        except ValueError:
+            return None
+    return None
+
+
 def get_team_sheet_today(rows: list[dict]) -> dict | None:
-    """Get latest row that has actual Spend data (not just a date)."""
+    """Get latest row that has actual Spend data AND is not in the future."""
     if not rows:
         return None
+
+    today = _now_egypt().replace(hour=0, minute=0, second=0, microsecond=0)
+
     for row in reversed(rows):
         spend_str = row.get("Spend", "").strip().replace(",", "")
-        # Must have a non-zero spend value
         try:
             spend_val = float(spend_str) if spend_str else 0
         except ValueError:
             spend_val = 0
-        if spend_val > 0:
-            return row
+
+        if spend_val <= 0:
+            continue
+
+        # Skip future dates - team leader might pre-fill tomorrow's row
+        row_date = _parse_sheet_date(row.get("Date", ""))
+        if row_date and row_date > today:
+            continue  # Future date, skip it
+
+        return row
     return None
 
 
