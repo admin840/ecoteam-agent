@@ -1046,8 +1046,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 image_bytes, name, img_type, result.get("description", "")
             )
             if response:
+                # Show what was received + what's missing
+                cat_label = REPORT_CATEGORY_LABELS.get(pay_category, "")
+                remaining = get_missing_categories(gid, "morning" if hour < 16 else "afternoon")
+
+                status_line = ""
+                if cat_label:
+                    status_line = f"\n\n📸 سجّلت: {cat_label} ✅"
+                    if remaining:
+                        status_line += f"\nلسه مستني: {' + '.join(remaining)}"
+                    else:
+                        status_line += f"\n✅ التقرير مكتمل!"
+
                 msg = await update.message.reply_text(
-                    f"🤖 {response}",
+                    f"🤖 {response}{status_line}",
                     reply_markup=feedback_keyboard(),
                 )
                 _last_bot_analysis[gid] = response
@@ -1097,9 +1109,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if any(w in analysis for w in ["⚠️", "🔴", "🚨", "فرق", "مشكلة"]):
                 await notify_owner(context, f"🔍 تنبيه - {name}:\n{analysis}")
         else:
-            await update.message.reply_text(f"📸 تقرير {period}: ({count}/{required})\n🤖 {summary}")
+            await update.message.reply_text(
+                f"📸 تقرير {period}: {cat_label} ✅\n{summary}{remaining_text}",
+                reply_markup=feedback_keyboard(),
+            )
     else:
-        await update.message.reply_text(f"📸 تقرير {period}: ({count}/{required})")
+        await update.message.reply_text(
+            f"📸 تقرير {period}: {cat_label} ✅{remaining_text}",
+            reply_markup=feedback_keyboard(),
+        )
 
     # Step 5: Completion message - check by categories not just count
     missing_cats = get_missing_categories(gid, "morning" if hour < 16 else "afternoon")
