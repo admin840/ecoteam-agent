@@ -64,6 +64,21 @@ ALERT_PICK_TEAM, ALERT_TYPE_MSG, ALERT_CONFIRM = range(3)
 BROADCAST_TYPE_MSG, BROADCAST_CONFIRM = range(10, 12)
 TEAM_PICK, COMPARE_PICK, PAUSE_PICK = range(20, 23)
 
+# ── Feedback system ──────────────────────────────────────────────────
+# Store last bot analysis per group so we know what to correct
+_last_bot_analysis: dict[int, str] = {}  # gid -> last analysis text
+
+
+def feedback_keyboard() -> InlineKeyboardMarkup:
+    """Inline buttons for every bot analysis."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ صح", callback_data="fb_correct"),
+            InlineKeyboardButton("❌ غلط", callback_data="fb_wrong"),
+            InlineKeyboardButton("✏️ هعدل", callback_data="fb_edit"),
+        ]
+    ])
+
 # ── Deductions file ──────────────────────────────────────────────────
 DEDUCTIONS_FILE = Path("deductions.json")
 
@@ -805,7 +820,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 image_bytes, name, img_type, result.get("description", "")
             )
             if response:
-                await update.message.reply_text(f"🤖 {response}")
+                msg = await update.message.reply_text(
+                    f"🤖 {response}",
+                    reply_markup=feedback_keyboard(),
+                )
+                _last_bot_analysis[gid] = response
         except Exception as e:
             logger.error("Non-report image error (%s): %s", name, e)
         return  # Don't count, don't analyze further
@@ -828,9 +847,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         analysis = await smart_analysis(name, result, report_type, image_bytes)
         if analysis:
-            # Send count + analysis in one message
+            # Send count + analysis + feedback buttons
             header = f"📸 تقرير {period}: ({count}/{required})\n🤖 {summary}\n\n"
-            await update.message.reply_text(header + analysis)
+            await update.message.reply_text(
+                header + analysis,
+                reply_markup=feedback_keyboard(),
+            )
+            _last_bot_analysis[gid] = analysis
             if any(w in analysis for w in ["⚠️", "🔴", "🚨", "فرق", "مشكلة"]):
                 await notify_owner(context, f"🔍 تنبيه - {name}:\n{analysis}")
         else:
@@ -866,7 +889,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             thumb_bytes = bytes(await tf.download_as_bytearray())
         analysis = await analyze_video_creative(bytes(video_bytes), name, thumb_bytes)
         if analysis:
-            await update.message.reply_text(f"🤖 {analysis}")
+            await update.message.reply_text(
+                f"🤖 {analysis}",
+                reply_markup=feedback_keyboard(),
+            )
+            _last_bot_analysis[gid] = analysis
         else:
             await update.message.reply_text("📸 ابعت screenshot من الإعلان عشان أقدر أحلله.")
     except Exception as e:
@@ -901,6 +928,58 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🤖 {response}")
     except Exception as e:
         logger.error("Text reply error (%s): %s", name, e)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Feedback handler: ✅ صح / ❌ غلط / ✏️ هعدل
+# ══════════════════════════════════════════════════════════════════════
+async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button clicks for feedback on bot analysis."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    gid = update.effective_chat.id
+    name = team_name(gid) if gid in TEAMS else "?"
+
+    from analyzer import get_leader, remember_exchange
+    leader = get_leader(name)
+
+    if data == "fb_correct":
+        # ✅ Bot was right - confirm and encourage
+        await query.edit_message_reply_markup(reply_markup=None)  # Remove buttons
+        await context.bot.send_message(
+            chat_id=gid,
+            text=f"✅ تمام يا {leader}! شكراً على التأكيد 💪\nلو محتاج أي حاجة أنا هنا.",
+        )
+        remember_exchange(name, f"[تأكيد ✅] {leader} أكد إن التحليل صح")
+
+    elif data == "fb_wrong":
+        # ❌ Bot was wrong - ask what was wrong
+        await query.edit_message_reply_markup(reply_markup=None)
+        last_analysis = _last_bot_analysis.get(gid, "")
+        await context.bot.send_message(
+            chat_id=gid,
+            text=(
+                f"😅 معلش يا {leader}! أنا لسه بتعلم.\n"
+                f"ممكن تقولي إيه الغلط عشان أفهم صح؟\n"
+                f"رد على الرسالة دي وقولي إيه الصح 🙏"
+            ),
+        )
+        remember_exchange(name, f"[تصحيح ❌] {leader} قال التحليل غلط - مستني التوضيح")
+
+    elif data == "fb_edit":
+        # ✏️ User wants to correct info
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=gid,
+            text=(
+                f"🙏 شكراً على تعاونك يا {leader}!\n"
+                f"قولي إيه المعلومة اللي محتاجة تعديل وإيه الصح عشان أتعلم منها.\n"
+                f"رد على الرسالة دي بالتعديل ✏️"
+            ),
+        )
+        remember_exchange(name, f"[تعديل ✏️] {leader} عايز يعدّل معلومة - مستني")
 
 
 # ── Forwarded message handler ────────────────────────────────────────
@@ -990,6 +1069,9 @@ def main():
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("weekly", weekly_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
+
+    # Feedback buttons handler (must be before ConversationHandlers)
+    app.add_handler(CallbackQueryHandler(handle_feedback, pattern="^fb_"))
 
     # Media & text handlers
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forwarded))
