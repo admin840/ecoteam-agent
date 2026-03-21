@@ -54,14 +54,59 @@ TEAMS: dict[int, str] = {
 MORNING_REQUIRED = 3
 AFTERNOON_REQUIRED = 3
 
-# ── State tracking ───────────────────────────────────────────────────
-# Track WHAT was sent, not just how many
-# Keys: gid -> set of received categories ("sheet", "budget", "dashboard")
-morning_photos: dict[int, int] = {}          # backward compat for count
+# ── State tracking (persisted to file) ───────────────────────────────
+TRACKING_FILE = Path("daily_tracking.json")
+
+
+def _load_tracking() -> dict:
+    """Load tracking state from file (survives restarts/deploys)."""
+    if TRACKING_FILE.exists():
+        try:
+            data = json.loads(TRACKING_FILE.read_text(encoding="utf-8"))
+            # Check if it's today's data
+            if data.get("date") == now_egypt().strftime("%Y-%m-%d"):
+                return data
+        except Exception:
+            pass
+    return {"date": now_egypt().strftime("%Y-%m-%d"),
+            "morning_photos": {}, "afternoon_photos": {},
+            "morning_types": {}, "afternoon_types": {}}
+
+
+def _save_tracking():
+    """Save tracking state to file."""
+    data = {
+        "date": now_egypt().strftime("%Y-%m-%d"),
+        "morning_photos": {str(k): v for k, v in morning_photos.items()},
+        "afternoon_photos": {str(k): v for k, v in afternoon_photos.items()},
+        "morning_types": {str(k): list(v) for k, v in morning_types.items()},
+        "afternoon_types": {str(k): list(v) for k, v in afternoon_types.items()},
+    }
+    TRACKING_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _restore_tracking():
+    """Restore tracking from file on startup."""
+    data = _load_tracking()
+    for k, v in data.get("morning_photos", {}).items():
+        morning_photos[int(k)] = v
+    for k, v in data.get("afternoon_photos", {}).items():
+        afternoon_photos[int(k)] = v
+    for k, v in data.get("morning_types", {}).items():
+        morning_types[int(k)] = set(v)
+    for k, v in data.get("afternoon_types", {}).items():
+        afternoon_types[int(k)] = set(v)
+
+
+# In-memory state (restored from file on startup)
+morning_photos: dict[int, int] = {}
 afternoon_photos: dict[int, int] = {}
-morning_types: dict[int, set[str]] = {}      # NEW: what types were received
+morning_types: dict[int, set[str]] = {}
 afternoon_types: dict[int, set[str]] = {}
 paused_teams: set[int] = set()
+
+# Restore from file immediately
+_restore_tracking()
 
 # Map image types to the 3 required report categories
 REPORT_CATEGORY_MAP = {
@@ -541,6 +586,7 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     afternoon_photos.clear()
     morning_types.clear()
     afternoon_types.clear()
+    _save_tracking()  # Save empty state
     from analyzer import reset_conversation_memory
     reset_conversation_memory()
     logger.info("Daily tracking reset (Egypt midnight)")
@@ -648,46 +694,41 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = now_egypt().strftime("%d/%m")
     t = now_egypt().strftime("%I:%M%p")
 
-    m_done = 0
-    a_done = 0
     done_list = []
     partial_list = []
     missing_list = []
 
     for gid, name in TEAMS.items():
         leader = get_leader(name)
-        m = morning_photos.get(gid, 0)
-        a = afternoon_photos.get(gid, 0)
         paused = " ⏸" if gid in paused_teams else ""
 
-        if m >= MORNING_REQUIRED:
-            m_done += 1
-        if a >= AFTERNOON_REQUIRED:
-            a_done += 1
+        m_received = get_received_categories(gid, "morning")
+        m_missing = get_missing_categories(gid, "morning")
 
-        if m >= MORNING_REQUIRED and a >= AFTERNOON_REQUIRED:
-            done_list.append(f"  ✅ {name}{paused}")
-        elif m > 0 or a > 0:
-            partial_list.append(f"  🟡 {name} - صبح {m}/{MORNING_REQUIRED} عصر {a}/{AFTERNOON_REQUIRED}{paused}")
+        if not m_missing:
+            done_list.append(f"  ✅ {name} ({leader}){paused}")
+        elif m_received:
+            received_short = ", ".join(m_received)
+            partial_list.append(f"  🟡 {name} ({leader}) - وصل: {received_short}{paused}")
         else:
-            missing_list.append(f"  ❌ {name}{paused}")
+            missing_list.append(f"  ❌ {name} ({leader}){paused}")
 
     lines = [f"📊 حالة الفرق  {today} {t}\n"]
 
     if done_list:
-        lines.append("مكتمل:")
+        lines.append("✅ مكتمل:")
         lines.extend(done_list)
         lines.append("")
     if partial_list:
-        lines.append("ناقص:")
+        lines.append("🟡 ناقص:")
         lines.extend(partial_list)
         lines.append("")
     if missing_list:
-        lines.append("لم يبدأ:")
+        lines.append("❌ لم يبدأ:")
         lines.extend(missing_list)
         lines.append("")
 
-    lines.append(f"الصبح {m_done}/{len(TEAMS)} | العصر {a_done}/{len(TEAMS)}")
+    lines.append(f"الصبح: مكتمل {len(done_list)} | ناقص {len(partial_list)} | لم يبدأ {len(missing_list)}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -1065,12 +1106,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if gid not in morning_types:
                     morning_types[gid] = set()
                 morning_types[gid].add(pay_category)
+                _save_tracking()
             else:
                 count = afternoon_photos.get(gid, 0) + 1
                 afternoon_photos[gid] = count
                 if gid not in afternoon_types:
                     afternoon_types[gid] = set()
                 afternoon_types[gid].add(pay_category)
+                _save_tracking()
 
         try:
             response = await handle_non_report_image(
@@ -1118,6 +1161,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             afternoon_types[gid].add(category)
         required = AFTERNOON_REQUIRED
 
+    _save_tracking()
     period = "الصبح" if hour < 16 else "العصر"
 
     # Step 4: Quick summary + smart analysis (one combined message)
