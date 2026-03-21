@@ -200,21 +200,11 @@ async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     msg = update.message
-    forward_chat = msg.forward_origin
-    if forward_chat:
-        # Try to get the original chat info
-        if hasattr(forward_chat, "sender_chat") and forward_chat.sender_chat:
-            fwd_info = f"{forward_chat.sender_chat.title} (ID: {forward_chat.sender_chat.id})"
-        elif hasattr(forward_chat, "chat") and forward_chat.chat:
-            fwd_info = f"{forward_chat.chat.title} (ID: {forward_chat.chat.id})"
-        else:
-            fwd_info = str(forward_chat)
-        await msg.reply_text(
-            f"Chat ID: {update.effective_chat.id}\n"
-            f"Forward from: {fwd_info}"
-        )
-    else:
-        await msg.reply_text(f"Chat ID: {update.effective_chat.id}")
+    await msg.reply_text(
+        f"Your Chat ID: {update.effective_chat.id}\n"
+        f"Message Chat ID: {msg.chat.id}\n"
+        f"Forward Origin: {msg.forward_origin}"
+    )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
