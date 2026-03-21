@@ -905,22 +905,56 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Text reply handler: interactive AI conversation
 # ══════════════════════════════════════════════════════════════════════
 async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """AI responds intelligently to any reply to the bot in groups."""
+    """AI responds to replies to the bot. Owner is silent unless bot is invited."""
     gid = update.effective_chat.id
     if gid not in TEAMS:
         return
-    if not update.message.reply_to_message:
-        return
-    if not update.message.reply_to_message.from_user:
-        return
-    bot_user = await context.bot.get_me()
-    if update.message.reply_to_message.from_user.id != bot_user.id:
+    if not update.message.text:
         return
 
-    from analyzer import analyze_text_message
-    name = team_name(gid)
+    user_id = update.effective_user.id if update.effective_user else None
     text = update.message.text
-    reply_to = update.message.reply_to_message.text or ""
+
+    # ── Owner talking in group → bot watches silently ──
+    if user_id == OWNER_CHAT_ID:
+        from analyzer import remember_exchange
+        name = team_name(gid)
+        # Just observe and remember, don't reply
+        remember_exchange(name, "", user_reply=f"[المالك]: {text[:200]}")
+        return
+
+    # ── "محتاج البوت" or mention → bot joins conversation ──
+    bot_invited = any(w in text for w in ["محتاج البوت", "يا بوت", "EcoBot", "ecobot", "/bot"])
+
+    # ── Normal reply to bot's message ──
+    is_reply_to_bot = False
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        bot_user = await context.bot.get_me()
+        is_reply_to_bot = update.message.reply_to_message.from_user.id == bot_user.id
+
+    if not is_reply_to_bot and not bot_invited:
+        return  # Not talking to the bot
+
+    from analyzer import analyze_text_message, save_learning, get_leader
+    name = team_name(gid)
+    leader = get_leader(name)
+    reply_to = ""
+    if update.message.reply_to_message:
+        reply_to = update.message.reply_to_message.text or ""
+
+    # ── Check if this is a correction after user clicked ❌ or ✏️ ──
+    waiting = context.chat_data.get("waiting_correction", False)
+    if waiting:
+        wrong_analysis = context.chat_data.get("wrong_analysis", "")
+        # Save the correction as a learning
+        save_learning(name, "correction", wrong_analysis, text)
+        context.chat_data["waiting_correction"] = False
+        context.chat_data["wrong_analysis"] = ""
+        await update.message.reply_text(
+            f"✅ اتعلمت يا {leader}! شكراً جداً على التصحيح.\n"
+            f"مش هكرر الغلطة دي تاني إن شاء الله 💪"
+        )
+        return
 
     try:
         response = await analyze_text_message(name, text, reply_to)
@@ -942,44 +976,47 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     name = team_name(gid) if gid in TEAMS else "?"
 
-    from analyzer import get_leader, remember_exchange
+    from analyzer import get_leader, remember_exchange, save_learning
     leader = get_leader(name)
 
     if data == "fb_correct":
-        # ✅ Bot was right - confirm and encourage
-        await query.edit_message_reply_markup(reply_markup=None)  # Remove buttons
+        await query.edit_message_reply_markup(reply_markup=None)
         await context.bot.send_message(
             chat_id=gid,
-            text=f"✅ تمام يا {leader}! شكراً على التأكيد 💪\nلو محتاج أي حاجة أنا هنا.",
+            text=f"✅ تمام يا {leader}! شكراً إنك أكدتلي 💪",
         )
-        remember_exchange(name, f"[تأكيد ✅] {leader} أكد إن التحليل صح")
+        remember_exchange(name, f"[✅] {leader} أكد")
 
     elif data == "fb_wrong":
-        # ❌ Bot was wrong - ask what was wrong
         await query.edit_message_reply_markup(reply_markup=None)
-        last_analysis = _last_bot_analysis.get(gid, "")
+        last = _last_bot_analysis.get(gid, "")
         await context.bot.send_message(
             chat_id=gid,
             text=(
-                f"😅 معلش يا {leader}! أنا لسه بتعلم.\n"
-                f"ممكن تقولي إيه الغلط عشان أفهم صح؟\n"
-                f"رد على الرسالة دي وقولي إيه الصح 🙏"
+                f"😅 أنا آسف يا {leader}! لسه بتعلم والله.\n"
+                f"قولي إيه اللي قولته غلط وإيه الصح؟\n"
+                f"رد على الرسالة دي عشان أتعلم وأبقى أحسن المرة الجاية 🙏"
             ),
         )
-        remember_exchange(name, f"[تصحيح ❌] {leader} قال التحليل غلط - مستني التوضيح")
+        # Mark that we're waiting for correction from this group
+        context.chat_data["waiting_correction"] = True
+        context.chat_data["wrong_analysis"] = last[:300]
+        remember_exchange(name, f"[❌ غلط] مستني تصحيح من {leader}")
 
     elif data == "fb_edit":
-        # ✏️ User wants to correct info
         await query.edit_message_reply_markup(reply_markup=None)
+        last = _last_bot_analysis.get(gid, "")
         await context.bot.send_message(
             chat_id=gid,
             text=(
-                f"🙏 شكراً على تعاونك يا {leader}!\n"
-                f"قولي إيه المعلومة اللي محتاجة تعديل وإيه الصح عشان أتعلم منها.\n"
+                f"🙏 شكراً يا {leader}!\n"
+                f"قولي إيه المعلومة اللي محتاجة تتعدل وأنا هتعلمها.\n"
                 f"رد على الرسالة دي بالتعديل ✏️"
             ),
         )
-        remember_exchange(name, f"[تعديل ✏️] {leader} عايز يعدّل معلومة - مستني")
+        context.chat_data["waiting_correction"] = True
+        context.chat_data["wrong_analysis"] = last[:300]
+        remember_exchange(name, f"[✏️ تعديل] مستني تصحيح من {leader}")
 
 
 # ── Forwarded message handler ────────────────────────────────────────

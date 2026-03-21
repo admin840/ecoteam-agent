@@ -85,6 +85,60 @@ def get_team_history(all_data: list[dict], team_name: str, days: int = 7) -> lis
 
 
 # ══════════════════════════════════════════════════════════════════════
+# PERSISTENT LEARNING MEMORY - bot learns from corrections
+# ══════════════════════════════════════════════════════════════════════
+
+LEARNINGS_FILE = Path("learnings.json")
+
+
+def load_learnings() -> list[dict]:
+    """Load all past corrections/learnings from file."""
+    if LEARNINGS_FILE.exists():
+        try:
+            return json.loads(LEARNINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_learning(team_name: str, category: str, what_bot_said: str, correction: str):
+    """Save a correction so the bot learns from it."""
+    data = load_learnings()
+    data.append({
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "team": team_name,
+        "category": category,  # "image_type", "numbers", "analysis", "other"
+        "bot_said": what_bot_said[:300],
+        "correction": correction[:300],
+    })
+    # Keep last 100 learnings
+    data = data[-100:]
+    LEARNINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Learning saved: %s - %s", category, correction[:50])
+
+
+def get_learnings_for_prompt(team_name: str = "", last_n: int = 5) -> str:
+    """Get relevant learnings to include in prompts."""
+    data = load_learnings()
+    if not data:
+        return ""
+
+    # Filter by team if specified, otherwise get recent
+    if team_name:
+        relevant = [d for d in data if d["team"] == team_name][-last_n:]
+    else:
+        relevant = data[-last_n:]
+
+    if not relevant:
+        return ""
+
+    lines = ["## تصحيحات سابقة (اتعلمت منها):"]
+    for d in relevant:
+        lines.append(f"- {d['date']}: {d['correction']}")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════
 # INDIVIDUAL TEAM SHEET - read directly from team's own Google Sheet
 # ══════════════════════════════════════════════════════════════════════
 
@@ -669,44 +723,43 @@ def format_context_for_prompt(ctx: dict) -> str:
 # SYSTEM PROMPT - Performance Marketing Manager
 # ══════════════════════════════════════════════════════════════════════
 
-SYSTEM_PROMPT = """أنت مدير تسويق رقمي (Performance Marketing Manager) خبير، اسمك "EcoBot".
-شغال مع فريق إعلانات بيشتغل على Facebook Ads و TikTok Ads لمتاجر إلكترونية في الكويت.
+SYSTEM_PROMPT = """أنت "EcoBot" - زميل شغل مصري خبير في التسويق الرقمي (Performance Marketing).
+لسه بتتعلم كل يوم ومعترف بده - بتسأل عشان تفهم مش عشان تحكم.
+
+## شخصيتك:
+- مصري دمه خفيف وعملي - بتتكلم زي ما الناس بتتكلم مش زي الآلات
+- متواضع - بتقول "أنا شايف" و"ممكن أكون غلطان" مش "الأرقام بتقول"
+- بتشجع وتمدح لما الشغل كويس - مش بس بتنتقد
+- لما مش متأكد بتسأل بدل ما تفترض
+- بتخاطب كل واحد باسمه وبتعامله كزميل مش كموظف
+
+## طريقة كلامك:
+- دايماً ابدأ بـ "أنا شايف إن..." أو "من اللي قدامي..." مش حقائق مطلقة
+- لو في فرق في الأرقام: "أنا شايف رقم كذا في الشيت بس الصورة بتقول كذا - أنهي الصح؟"
+- لو الأداء كويس: "برافو يا [اسم]! CPO تحفة 💪"
+- لو في مشكلة: "يا [اسم] أنا ملاحظ حاجة... الـ CPO طالع شوية. إيه رأيك؟"
+- لو مش فاهم حاجة: "ممكن توضحلي الصورة دي؟ أنا مش متأكد فهمتها صح"
+- خلّي كلامك قصير وطبيعي - زي ما بتكلم زميلك على واتساب
 
 ## خبراتك:
-- 10+ سنين في Performance Marketing و Paid Media
-- خبير في Facebook Ads Manager و TikTok Ads
-- تحليل البيانات والـ KPIs (CPO, CPA, ROAS, CTR, CVR)
-- إدارة البادجيت وتوزيعه على الحملات
-- تحسين الـ Creatives والـ Ad Copy
-- استراتيجيات الـ Scaling والـ Testing
+- Performance Marketing و Facebook/TikTok Ads
+- تحليل KPIs (CPO, CPA, ROAS, CTR)
+- إدارة البادجيت والحملات
+- تحسين Creatives
 
-## طريقة شغلك:
-1. بتحلل كل screenshot بعمق مش بس أرقام - بتفهم السياق والـ trend
-2. بتقارن مع البيانات في الشيت وتكتشف أي فرق أو خطأ
-3. لو الأرقام مش متطابقة بتطلب تصحيح فوراً - ده أولوية قصوى
-4. بتحلل الأداء في سياق الشهر كله مش بس اليوم
-5. بتقارن الفريق مع باقي الفرق عشان تعرف هو فين
-6. لو في مشكلة بتسأل أسئلة ذكية وبتطلب proof
-7. بتدي نصايح عملية ومحددة مش كلام عام
-8. بتطلب معلومات إضافية لو محتاج (شيت الإعلانات، الـ Creative، breakdown)
-9. بتربط بين الـ Creative والأداء - لو الأداء وحش بتسأل عن آخر تغيير في الإعلانات
-
-## حدود القرار:
+## فهمك للأرقام:
+- CPO = Spend ÷ New Orders (سعر الطلب قبل التسليم)
+- CPA = Spend أمس ÷ Delivered النهاردة (السعر الحقيقي - الأهم)
 - CPO: 🟢 ≤ 150 | 🟡 ≤ 180 | 🔴 > 180
-- CPA: 🟢 ≤ 150 | 🟡 ≤ 180 | 🔴 > 180
-- Cancel Rate: 🔴 ≥ 30%
-- فرق أكتر من 10% في الـ Spend = لازم يتراجع
-- كل المبالغ بالجنيه المصري (EGP)
-- الدفع بطريقتين: فواتير (مديونية) أو أكواد فوري (رصيد مسبق)
+- Cancel% ≥ 30% = 🔴 مشكلة
+- كل المبالغ بالجنيه المصري
 
-## أسلوبك:
-- مباشر وعملي - مش بتلف وتدور
-- بتخاطب التيم ليدر بالاسم
-- لو الأرقام تمام بتشجع وتمدح
-- لو في مشكلة بتوضح إيه المشكلة وإيه الحل
-- بتسأل أسئلة تخلي الـ Media Buyer يفكر ويتعلم
-- ردك قصير ومختصر - مش مقال
-- رد دايماً بالعربي (مصري)"""
+## قواعد:
+- رد بالعربي المصري دايماً
+- مختصر (3-5 سطور ماكس)
+- لو كل حاجة تمام: سطرين مدح وسؤال خفيف
+- متفترضش مشاكل من عندك
+- لو الشيت فاضي: ده عادي ممكن لسه محدش حدّثه - متقلقش"""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1033,6 +1086,9 @@ async def smart_analysis(
         is_mtd = True
         logger.info("Screenshot looks like MTD totals (ss=%s vs daily=%s)", ss_spend, ts_spend)
 
+    # Get learnings for this team
+    learnings_text = get_learnings_for_prompt(team_name)
+
     # Verify screenshot vs team sheet (skip if MTD)
     if is_mtd:
         verification = {"status": "mtd_totals", "discrepancies": [], "summary": "📊 الأرقام دي MTD (تراكمي الشهر) مش أرقام اليوم"}
@@ -1113,25 +1169,22 @@ async def smart_analysis(
 {ss_text}
 {ts_text}
 {context_text}
+{learnings_text}
 
 ## نتيجة المقارنة: {verification['summary']}
 
 ## المطلوب:
-حلل بناءً على الصورة + شيت الفريق:
-1. لو الأرقام متطابقة: قيّم الأداء (CPO كويس؟ trend بيتحسن؟)
-2. لو فيه حاجة محتاجة تتحسن: نصيحة عملية واحدة
+ابدأ بـ "أنا شايف إن..." وحلل بناءً على الصورة + شيت الفريق:
+1. لو الأرقام متطابقة: قيّم الأداء
+2. لو فيه حاجة محتاجة تتحسن: نصيحة عملية
 3. لو كل حاجة تمام: امدح باختصار
 
-## فهم الأرقام:
-- CPO = Spend ÷ New Orders (سعر الطلب قبل التسليم)
-- CPA = Spend أمس ÷ Delivered النهاردة (السعر الحقيقي) - الأهم
-- CPO 🟢 ≤ 150 | 🟡 ≤ 180 | 🔴 > 180
-- Cancel% 🔴 ≥ 30%
-
 قواعد:
+- ابدأ بـ "أنا شايف" مش حقائق مطلقة
 - خاطب {leader} بالاسم
 - مختصر (3-5 سطور)
 - حلل بس اللي قدامك - متفترضش مشاكل
+- لو حد صحّحلك قبل كده (في التصحيحات السابقة) - خد بالك منها
 - بالعربي المصري"""
 
     try:
