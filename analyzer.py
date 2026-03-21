@@ -379,9 +379,26 @@ def generate_quick_summary(screenshot_data: dict) -> str:
 # Video Creative Analysis
 # ══════════════════════════════════════════════════════════════════════
 
-def extract_video_frames(video_bytes: bytes, num_frames: int = 4) -> list[bytes]:
+def get_video_duration(video_path: str) -> float:
+    """Get video duration in seconds using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return float(result.stdout.strip())
+    except Exception:
+        return 15.0
+
+
+def extract_video_frames(video_bytes: bytes) -> list[bytes]:
     """
-    Extract key frames from a video using ffmpeg.
+    Extract smart frames from video:
+    - 3 frames in first 3 seconds (Hook analysis)
+    - 5 frames spread across the rest (Content + CTA)
     Returns list of JPEG image bytes.
     """
     frames = []
@@ -389,99 +406,193 @@ def extract_video_frames(video_bytes: bytes, num_frames: int = 4) -> list[bytes]
         video_path = Path(tmpdir) / "input.mp4"
         video_path.write_bytes(video_bytes)
 
-        # First, get video duration
-        probe_cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(video_path),
-        ]
-        try:
-            result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15)
-            duration = float(result.stdout.strip())
-        except Exception:
-            duration = 10.0  # Default fallback
-
-        # Calculate timestamps for frames (evenly spaced)
+        duration = get_video_duration(str(video_path))
         if duration <= 0:
-            duration = 10.0
-        timestamps = []
-        for i in range(num_frames):
-            t = (duration / (num_frames + 1)) * (i + 1)
-            timestamps.append(min(t, duration - 0.1))
+            duration = 15.0
 
-        # Extract frames at each timestamp
+        # Smart timestamp distribution:
+        # Hook: 0.5s, 1.5s, 3s (first 3 seconds - critical!)
+        # Content: evenly spaced from 3s to end
+        timestamps = [0.5, 1.5, 3.0]
+
+        remaining = max(duration - 3, 1)
+        content_frames = min(5, int(remaining / 2))
+        for i in range(content_frames):
+            t = 3.0 + (remaining / (content_frames + 1)) * (i + 1)
+            timestamps.append(min(t, duration - 0.2))
+
+        # Last frame (CTA usually at the end)
+        if duration > 4:
+            timestamps.append(duration - 0.5)
+
+        # Extract each frame
         for i, ts in enumerate(timestamps):
             output_path = Path(tmpdir) / f"frame_{i}.jpg"
-            extract_cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(ts),
+            cmd = [
+                "ffmpeg", "-y", "-ss", f"{ts:.2f}",
                 "-i", str(video_path),
-                "-vframes", "1",
-                "-q:v", "2",
+                "-vframes", "1", "-q:v", "2",
                 str(output_path),
             ]
             try:
-                subprocess.run(extract_cmd, capture_output=True, timeout=15)
-                if output_path.exists():
+                subprocess.run(cmd, capture_output=True, timeout=15)
+                if output_path.exists() and output_path.stat().st_size > 0:
                     frames.append(output_path.read_bytes())
             except Exception as e:
-                logger.warning("Failed to extract frame %d: %s", i, e)
+                logger.warning("Frame %d extract failed: %s", i, e)
 
+    logger.info("Extracted %d frames from video (%.1fs)", len(frames), duration)
     return frames
+
+
+def extract_audio_transcript(video_bytes: bytes) -> str:
+    """
+    Extract audio from video and transcribe using Whisper.
+    Returns the transcript text or empty string.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        video_path = Path(tmpdir) / "input.mp4"
+        audio_path = Path(tmpdir) / "audio.wav"
+        video_path.write_bytes(video_bytes)
+
+        # Extract audio with ffmpeg (16kHz mono WAV for Whisper)
+        cmd = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vn", "-acodec", "pcm_s16le",
+            "-ar", "16000", "-ac", "1",
+            str(audio_path),
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if not audio_path.exists() or audio_path.stat().st_size < 1000:
+                logger.info("No audio track or too short")
+                return ""
+        except Exception as e:
+            logger.warning("Audio extraction failed: %s", e)
+            return ""
+
+        # Transcribe with faster-whisper
+        try:
+            from faster_whisper import WhisperModel
+            model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            # Auto-detect language (supports Arabic, English, Hindi, etc.)
+            segments, info = model.transcribe(
+                str(audio_path),
+                beam_size=3,
+            )
+            text_parts = [seg.text.strip() for seg in segments if seg.text.strip()]
+            transcript = " ".join(text_parts)
+            logger.info("Transcript (%s, %.1fs): %s",
+                        info.language, info.duration, transcript[:100])
+            return transcript
+        except ImportError:
+            logger.warning("faster-whisper not available")
+            return ""
+        except Exception as e:
+            logger.warning("Transcription failed: %s", e)
+            return ""
+
+
+# ── Creative Evaluation Scorecard ────────────────────────────────────
+CREATIVE_SCORECARD_PROMPT = """
+## نظام التقييم (Scorecard):
+قيّم كل عنصر من 1-10 وادي تعليق مختصر:
+
+| العنصر | الدرجة | التعليق |
+|--------|--------|---------|
+| 🎣 Hook (أول 3 ثواني) | ?/10 | هل بيوقف الـ scroll؟ |
+| 🎨 التصميم والجودة | ?/10 | احترافي؟ واضح؟ |
+| ✍️ النص/الكوبي | ?/10 | مقنع؟ واضح؟ |
+| 📢 CTA | ?/10 | واضح ومحفز؟ |
+| 🎯 مناسب للـ Target | ?/10 | مناسب للجمهور؟ |
+| 🔊 الصوت/Voiceover | ?/10 | واضح ومؤثر؟ |
+| 📊 التقييم العام | ?/10 | |
+
+### ثم اكتب:
+- ✅ نقاط القوة (2-3)
+- ❌ نقاط الضعف (2-3)
+- 💡 اقتراحات التحسين (2-3 محددة وعملية)
+- 🤔 سؤال للـ Media Buyer يخليه يفكر
+"""
 
 
 async def analyze_video_creative(
     video_bytes: bytes, team_name: str, thumbnail_bytes: bytes | None = None
 ) -> str:
     """
-    Analyze a video creative by extracting frames and sending to Claude.
-    Returns analysis and coaching feedback.
+    Full video creative analysis:
+    1. Extract 8-10 smart frames
+    2. Extract and transcribe audio (voiceover)
+    3. Send everything to Claude with scorecard
     """
     if not CLAUDE_API_KEY:
         return ""
 
     leader = get_leader(team_name)
 
-    # Extract frames from video
-    frames = extract_video_frames(video_bytes, num_frames=4)
-
+    # Step 1: Extract frames
+    frames = extract_video_frames(video_bytes)
     if not frames and thumbnail_bytes:
         frames = [thumbnail_bytes]
-
     if not frames:
-        return f"⚠️ مش قادر أحلل الفيديو. {leader}، ابعتي screenshot من الفيديو."
+        return f"⚠️ مش قادر أحلل الفيديو. {leader}، ابعت screenshot من الإعلان."
 
-    # Build message content with all frames
+    # Step 2: Extract and transcribe audio
+    transcript = extract_audio_transcript(video_bytes)
+
+    # Step 3: Get video duration
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vp = Path(tmpdir) / "v.mp4"
+        vp.write_bytes(video_bytes)
+        duration = get_video_duration(str(vp))
+
+    # Step 4: Build Claude message
     content = []
+
+    # Add frame labels
+    frame_labels = []
+    if len(frames) >= 3:
+        frame_labels = ["Hook (0.5s)", "Hook (1.5s)", "Hook (3s)"]
+        for i in range(3, len(frames) - 1):
+            frame_labels.append(f"Content ({i})")
+        if len(frames) > 3:
+            frame_labels.append("CTA/End")
+
     for i, frame in enumerate(frames):
+        label = frame_labels[i] if i < len(frame_labels) else f"Frame {i+1}"
+        content.append({"type": "text", "text": f"📸 {label}:"})
         img_b64 = base64.b64encode(frame).decode("utf-8")
         content.append({
             "type": "image",
             "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
         })
 
-    prompt = f"""أنت مدير تسويق خبير بتراجع Creative (إعلان فيديو) لفريق {team_name} (التيم ليدر: {leader}).
+    # Build analysis prompt
+    prompt_parts = [
+        f"أنت مدير Performance Marketing خبير بتراجع Creative (فيديو إعلاني) لفريق {team_name}.",
+        f"التيم ليدر: {leader}",
+        f"مدة الفيديو: {duration:.1f} ثانية",
+        f"عدد الفريمات المستخرجة: {len(frames)}",
+    ]
 
-الصور دي فريمات مستخرجة من فيديو إعلاني. حللها كالتالي:
+    if transcript:
+        prompt_parts.append(f"\n🔊 نص الـ Voiceover/الصوت (ممكن يكون عربي، إنجليزي، هندي، أو لغة تانية):")
+        prompt_parts.append(f"\"{transcript}\"")
+        prompt_parts.append("حلل النص ده: هل مقنع؟ واضح؟ بيوصل الرسالة؟ مناسب للجمهور المستهدف؟")
+    else:
+        prompt_parts.append("\n🔇 الفيديو ده مفيهوش voiceover واضح (موسيقى بس أو صامت).")
+        prompt_parts.append("قيّم: هل الفيديو محتاج voiceover عشان يكون أقوى؟")
 
-1. **المحتوى**: إيه المنتج أو العرض اللي في الإعلان؟
-2. **الـ Hook**: أول 3 ثواني بتلفت الانتباه ولا لا؟
-3. **الـ CTA**: في Call to Action واضح؟
-4. **النص والتصميم**: النص واضح؟ الألوان مناسبة؟ الجودة كويسة؟
-5. **نقاط القوة**: إيه الحاجات الكويسة في الإعلان؟
-6. **نقاط الضعف**: إيه اللي محتاج يتحسن؟
-7. **اقتراحات**: 2-3 اقتراحات محددة لتحسين الأداء
+    prompt_parts.append(f"\n{CREATIVE_SCORECARD_PROMPT}")
+    prompt_parts.append(f"\nخاطب {leader} بالاسم. بالعربي المصري. مختصر وعملي.")
 
-خاطب {leader} بالاسم. رد مختصر وعملي (6-10 سطور). بالعربي المصري."""
-
-    content.append({"type": "text", "text": prompt})
+    content.append({"type": "text", "text": "\n".join(prompt_parts)})
 
     try:
         client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1000,
+            max_tokens=1200,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
         )
@@ -493,29 +604,38 @@ async def analyze_video_creative(
 
 
 async def analyze_image_creative(image_bytes: bytes, team_name: str) -> str:
-    """Analyze an image creative (banner, post, story)."""
+    """Analyze an image creative with full scorecard."""
     if not CLAUDE_API_KEY:
         return ""
 
     leader = get_leader(team_name)
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    prompt = f"""أنت مدير تسويق خبير بتراجع Creative (إعلان صورة) لفريق {team_name} (التيم ليدر: {leader}).
+    prompt = f"""أنت مدير Performance Marketing خبير بتراجع Creative (إعلان صورة) لفريق {team_name} (التيم ليدر: {leader}).
 
-حلل الإعلان ده:
-1. **المنتج/العرض**: إيه اللي بيتعرض؟
-2. **التصميم**: الجودة، الألوان، الترتيب
-3. **النص**: واضح؟ مقنع؟ في CTA؟
-4. **نقاط القوة و الضعف**
-5. **2-3 اقتراحات للتحسين**
+حلل الإعلان ده بنظام الـ Scorecard:
 
-خاطب {leader} بالاسم. رد مختصر (4-6 سطور). بالعربي المصري."""
+| العنصر | الدرجة | التعليق |
+|--------|--------|---------|
+| 🎨 التصميم | ?/10 | |
+| ✍️ النص/الكوبي | ?/10 | |
+| 📢 CTA | ?/10 | |
+| 🎯 مناسب للـ Target | ?/10 | |
+| 📊 التقييم العام | ?/10 | |
+
+ثم:
+- ✅ نقاط القوة
+- ❌ نقاط الضعف
+- 💡 اقتراحات التحسين (2-3)
+- 🤔 سؤال للـ Media Buyer
+
+خاطب {leader} بالاسم. بالعربي المصري. مختصر."""
 
     try:
         client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
         message = client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=800,
+            max_tokens=1000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
