@@ -139,6 +139,50 @@ def get_learnings_for_prompt(team_name: str = "", last_n: int = 5) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# IMAGE PATTERN MEMORY - bot learns image types from corrections
+# ══════════════════════════════════════════════════════════════════════
+
+IMAGE_PATTERNS_FILE = Path("image_patterns.json")
+
+
+def load_image_patterns() -> dict:
+    """Load learned image patterns: {description_keyword: correct_type}"""
+    if IMAGE_PATTERNS_FILE.exists():
+        try:
+            return json.loads(IMAGE_PATTERNS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_image_pattern(description: str, correct_type: str):
+    """Save a learned image pattern so bot recognizes it next time."""
+    patterns = load_image_patterns()
+    # Extract keywords from description
+    keywords = [w.strip().lower() for w in description.split() if len(w.strip()) > 2]
+    for kw in keywords:
+        patterns[kw] = correct_type
+    IMAGE_PATTERNS_FILE.write_text(json.dumps(patterns, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Image pattern learned: %s -> %s", description[:50], correct_type)
+
+
+def check_learned_patterns(description: str) -> str | None:
+    """Check if we've learned what this image type is from past corrections."""
+    patterns = load_image_patterns()
+    if not patterns:
+        return None
+    desc_lower = description.lower()
+    matches = {}
+    for keyword, img_type in patterns.items():
+        if keyword in desc_lower:
+            matches[img_type] = matches.get(img_type, 0) + 1
+    if matches:
+        # Return the type with most keyword matches
+        return max(matches, key=matches.get)
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════
 # INDIVIDUAL TEAM SHEET - read directly from team's own Google Sheet
 # ══════════════════════════════════════════════════════════════════════
 
@@ -747,10 +791,13 @@ SYSTEM_PROMPT = """أنت "EcoBot" - زميل شغل مصري خبير في ال
 - إدارة البادجيت والحملات
 - تحسين Creatives
 
-## فهمك للأرقام:
-- CPO = Spend ÷ New Orders (سعر الطلب قبل التسليم)
-- CPA = Spend أمس ÷ Delivered النهاردة (السعر الحقيقي - الأهم)
-- CPO: 🟢 ≤ 150 | 🟡 ≤ 180 | 🔴 > 180
+## فهمك للأرقام (مهم جداً):
+- **CPO** = Spend اليوم ÷ New Orders اليوم (سعر الطلب قبل التسليم)
+- **CPA** = Spend أمس ÷ Delivered المسجّلة النهاردة (السعر الحقيقي - الأهم)
+  مثال: يوم 20 صرف 3000 جاب 25 طلب → CPO=120. يوم 21 اتسلم 12 بس → CPA=250
+  الـ CPA المكتوب في صف يوم 21 = أداء يوم 20 فعلياً
+- **CPA الشهر** = إجمالي Spend ÷ إجمالي Delivered (الصورة الكبيرة)
+- CPO/CPA: 🟢 ≤ 150 | 🟡 ≤ 180 | 🔴 > 180
 - Cancel% ≥ 30% = 🔴 مشكلة
 - كل المبالغ بالجنيه المصري
 
@@ -849,12 +896,26 @@ async def classify_image(image_bytes: bytes) -> dict:
             response_text = response_text.rsplit("```", 1)[0].strip()
 
         result = json.loads(response_text)
-        logger.info("Image classified as: %s (%.0f%%)", result.get("type"), result.get("confidence", 0) * 100)
+        confidence = result.get("confidence", 0)
+        description = result.get("description", "")
+
+        # Check if learned patterns override the classification
+        learned = check_learned_patterns(description)
+        if learned and confidence < 0.8:
+            logger.info("Learned pattern override: %s -> %s", result.get("type"), learned)
+            result["type"] = learned
+            result["confidence"] = 0.85
+            result["_learned"] = True
+
+        # Mark low confidence for the bot to ask
+        result["_low_confidence"] = confidence < 0.7
+
+        logger.info("Image classified as: %s (%.0f%%)", result.get("type"), confidence * 100)
         return result
 
     except Exception as e:
         logger.error("Image classification error: %s", e)
-        return {"type": "other", "confidence": 0, "description": str(e)}
+        return {"type": "other", "confidence": 0, "description": str(e), "_low_confidence": True}
 
 
 # ══════════════════════════════════════════════════════════════════════

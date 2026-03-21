@@ -811,6 +811,27 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     img_type = result.get("image_type", "other")
+    low_confidence = result.get("_low_confidence", False)
+
+    # Step 1.5: If bot isn't sure about image type, ask!
+    if low_confidence and img_type != "other":
+        from analyzer import get_leader as _gl, IMAGE_TYPES
+        _leader = _gl(name)
+        type_label = IMAGE_TYPES.get(img_type, img_type)
+        ask_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ صح كده", callback_data=f"imgtype_yes_{img_type}")],
+            [InlineKeyboardButton("❌ لا، دي حاجة تانية", callback_data=f"imgtype_no_{img_type}")],
+        ])
+        await update.message.reply_text(
+            f"🤔 يا {_leader}، أنا شايف إن الصورة دي: **{type_label}**\nصح كده؟",
+            reply_markup=ask_keyboard,
+            parse_mode="Markdown",
+        )
+        # Store image bytes for later processing after confirmation
+        context.chat_data["pending_image"] = image_bytes
+        context.chat_data["pending_result"] = result
+        context.chat_data["pending_report_type"] = report_type
+        return
 
     # Step 2: Handle based on image type
     if img_type not in REPORT_IMAGE_TYPES:
@@ -1031,6 +1052,92 @@ async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Image type confirmation handler
+# ══════════════════════════════════════════════════════════════════════
+async def handle_imgtype_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle image type yes/no confirmation buttons."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    gid = update.effective_chat.id
+    name = team_name(gid) if gid in TEAMS else "?"
+
+    from analyzer import get_leader, save_image_pattern, remember_exchange
+
+    leader = get_leader(name)
+
+    if data.startswith("imgtype_yes_"):
+        # User confirmed image type is correct
+        img_type = data.replace("imgtype_yes_", "")
+        await query.edit_message_reply_markup(reply_markup=None)
+
+        # Save pattern for future
+        pending_result = context.chat_data.get("pending_result", {})
+        desc = pending_result.get("description", "")
+        if desc:
+            save_image_pattern(desc, img_type)
+
+        await context.bot.send_message(
+            chat_id=gid,
+            text=f"✅ شكراً يا {leader}! اتعلمت 💪",
+        )
+
+        # Now process the image normally
+        # Re-trigger analysis with confirmed type
+        image_bytes = context.chat_data.get("pending_image")
+        if image_bytes:
+            pending_result["_low_confidence"] = False  # Now we're confident
+            # Continue processing...
+            from analyzer import (
+                handle_non_report_image, smart_analysis,
+                generate_quick_summary, REPORT_IMAGE_TYPES,
+            )
+
+            if img_type not in REPORT_IMAGE_TYPES:
+                response = await handle_non_report_image(
+                    image_bytes, name, img_type, desc
+                )
+                if response:
+                    await context.bot.send_message(
+                        chat_id=gid, text=f"🤖 {response}",
+                        reply_markup=feedback_keyboard(),
+                    )
+                    _last_bot_analysis[gid] = response
+            else:
+                result = pending_result
+                if "error" not in result:
+                    summary = generate_quick_summary(result)
+                    report_type = context.chat_data.get("pending_report_type", "morning")
+                    analysis = await smart_analysis(name, result, report_type, image_bytes)
+                    if analysis:
+                        await context.bot.send_message(
+                            chat_id=gid,
+                            text=f"🤖 {summary}\n\n{analysis}",
+                            reply_markup=feedback_keyboard(),
+                        )
+                        _last_bot_analysis[gid] = analysis
+
+        # Clean up
+        context.chat_data.pop("pending_image", None)
+        context.chat_data.pop("pending_result", None)
+        context.chat_data.pop("pending_report_type", None)
+
+    elif data.startswith("imgtype_no_"):
+        # User says classification is wrong
+        await query.edit_message_reply_markup(reply_markup=None)
+        await context.bot.send_message(
+            chat_id=gid,
+            text=(
+                f"😅 معلش يا {leader}! قولي الصورة دي إيه بالظبط؟\n"
+                f"رد على الرسالة دي وقولي (مثلاً: فاتورة فيسبوك، شيت الطلبات، داشبورد تيك توك...)"
+            ),
+        )
+        context.chat_data["waiting_imgtype_correction"] = True
+        remember_exchange(name, f"[❌ نوع صورة غلط] مستني التصحيح من {leader}")
+
+
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ تم الإلغاء")
     context.user_data.clear()
@@ -1107,8 +1214,9 @@ def main():
     app.add_handler(CommandHandler("weekly", weekly_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
 
-    # Feedback buttons handler (must be before ConversationHandlers)
+    # Feedback & image type buttons handler
     app.add_handler(CallbackQueryHandler(handle_feedback, pattern="^fb_"))
+    app.add_handler(CallbackQueryHandler(handle_imgtype_callback, pattern="^imgtype_"))
 
     # Media & text handlers
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forwarded))
