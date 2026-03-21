@@ -886,7 +886,29 @@ async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: st
             "_classified": True,
         }
 
-    # Step 2: Extract numbers for report-type images
+    # Step 2: For Google Sheets screenshots, read the sheet DIRECTLY instead of from image
+    if img_type in ("order_sheet", "budget_sheet"):
+        team_rows = await fetch_team_sheet(team_name)
+        today_row = get_team_sheet_today(team_rows) if team_rows else None
+        if today_row:
+            spend = _safe_num(today_row.get("Spend", ""))
+            orders = _safe_num(today_row.get("New Orders", ""))
+            cpo = _safe_num(today_row.get("CPO", ""))
+            return {
+                "image_type": img_type,
+                "spend": spend,
+                "orders": orders,
+                "cpo": cpo,
+                "delivered": _safe_num(today_row.get("Delivered", "")),
+                "cancel": _safe_num(today_row.get("Cancel", "")),
+                "hold": _safe_num(today_row.get("Hold", "")),
+                "date": today_row.get("Date", ""),
+                "notes": "تم قراءة الأرقام من الشيت مباشرة",
+                "_from_sheet": True,
+            }
+        # If can't read sheet, fall through to image extraction
+
+    # Step 3: Extract numbers from image (for ads dashboards)
     leader = get_leader(team_name)
 
     prompt = f"""أنت بتراجع screenshot من فريق {team_name} (التيم ليدر: {leader}).
