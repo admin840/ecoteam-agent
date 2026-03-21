@@ -87,8 +87,10 @@ def team_name(gid: int) -> str:
     return TEAMS.get(gid, str(gid))
 
 
-def teams_keyboard() -> InlineKeyboardMarkup:
+def teams_keyboard(include_all: bool = False) -> InlineKeyboardMarkup:
     buttons = []
+    if include_all:
+        buttons.append([InlineKeyboardButton("📢 كل الفرق", callback_data="team_all")])
     for gid, name in TEAMS.items():
         buttons.append([InlineKeyboardButton(name, callback_data=f"team_{gid}")])
     return InlineKeyboardMarkup(buttons)
@@ -376,24 +378,33 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def alert_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return ConversationHandler.END
-    await update.message.reply_text("اختار الفريق:", reply_markup=teams_keyboard())
+    await update.message.reply_text("اختار الفريق أو كل الفرق:", reply_markup=teams_keyboard(include_all=True))
     return ALERT_PICK_TEAM
 
 
 async def alert_pick_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    gid = int(query.data.replace("team_", ""))
-    context.user_data["alert_gid"] = gid
-    await query.edit_message_text(f"فريق: {team_name(gid)}\n\n✏️ اكتب الرسالة:")
+    picked = query.data.replace("team_", "")
+    if picked == "all":
+        context.user_data["alert_gid"] = "all"
+        await query.edit_message_text("📢 كل الفرق\n\n✏️ اكتب الرسالة:")
+    else:
+        gid = int(picked)
+        context.user_data["alert_gid"] = gid
+        await query.edit_message_text(f"فريق: {team_name(gid)}\n\n✏️ اكتب الرسالة:")
     return ALERT_TYPE_MSG
 
 
 async def alert_type_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["alert_msg"] = update.message.text
-    gid = context.user_data["alert_gid"]
+    target = context.user_data["alert_gid"]
+    if target == "all":
+        label = f"كل الفرق ({len(TEAMS)} جروبات)"
+    else:
+        label = team_name(target)
     await update.message.reply_text(
-        f"📤 إرسال لـ {team_name(gid)}:\n\n{update.message.text}\n\nتأكيد؟",
+        f"📤 إرسال لـ {label}:\n\n{update.message.text}\n\nتأكيد؟",
         reply_markup=confirm_keyboard(),
     )
     return ALERT_CONFIRM
@@ -403,10 +414,14 @@ async def alert_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "confirm_yes":
-        gid = context.user_data["alert_gid"]
+        target = context.user_data["alert_gid"]
         msg = context.user_data["alert_msg"]
-        await send_to_group(context, gid, msg)
-        await query.edit_message_text(f"✅ تم الإرسال لـ {team_name(gid)}")
+        if target == "all":
+            await send_to_all(context, msg)
+            await query.edit_message_text(f"✅ تم الإرسال لكل الفرق ({len(TEAMS)} جروبات)")
+        else:
+            await send_to_group(context, target, msg)
+            await query.edit_message_text(f"✅ تم الإرسال لـ {team_name(target)}")
     else:
         await query.edit_message_text("❌ تم الإلغاء")
     context.user_data.clear()
