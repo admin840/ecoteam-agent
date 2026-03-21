@@ -582,8 +582,14 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══ Main ═════════════════════════════════════════════════════════════
+async def post_init(application):
+    """Delete any existing webhook to avoid conflicts."""
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Webhook deleted, polling mode ready.")
+
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     # ── Conversation: /alert ──
     alert_conv = ConversationHandler(
