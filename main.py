@@ -562,8 +562,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     from analyzer import (
-        analyze_screenshot, compare_and_verify,
-        generate_smart_summary, get_leader,
+        analyze_screenshot, smart_analysis,
+        generate_quick_summary, get_leader,
     )
 
     name = team_name(gid)
@@ -610,20 +610,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await analyze_screenshot(bytes(image_bytes), name, report_type)
 
         if "error" not in result:
-            # Generate summary
-            summary = await generate_smart_summary(name, result)
+            # Quick summary
+            summary = generate_quick_summary(result)
             await update.message.reply_text(f"🤖 {summary}")
 
-            # Compare with Master Sheet and verify
-            verification = await compare_and_verify(name, result, report_type)
-            if verification:
-                # Send warning to group
-                await update.message.reply_text(verification)
-                # Also notify owner
-                await notify_owner(
-                    context,
-                    f"🔍 تنبيه مراجعة - {name}:\n{verification}"
-                )
+            # Full smart analysis (compare + coach + advice)
+            analysis = await smart_analysis(
+                name, result, report_type, bytes(image_bytes)
+            )
+            if analysis:
+                await update.message.reply_text(analysis)
+                # Notify owner if there are warnings
+                if any(w in analysis for w in ["⚠️", "🔴", "🚨", "فرق", "مشكلة"]):
+                    await notify_owner(
+                        context,
+                        f"🔍 تنبيه - {name}:\n{analysis}"
+                    )
         else:
             logger.warning("Analysis failed for %s: %s", name, result.get("error"))
 
@@ -643,6 +645,35 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ تقرير العصر مكتمل! شكراً {leader} 🎉"
             )
             logger.info("Afternoon report complete for %s", name)
+
+
+# ── Text reply handler: AI responds to team leader replies ───────────
+async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """When someone replies to the bot in a group, analyze and respond."""
+    gid = update.effective_chat.id
+    if gid not in TEAMS:
+        return
+    # Only respond to replies to the bot's messages
+    if not update.message.reply_to_message:
+        return
+    if not update.message.reply_to_message.from_user:
+        return
+    bot_user = await context.bot.get_me()
+    if update.message.reply_to_message.from_user.id != bot_user.id:
+        return
+
+    from analyzer import analyze_text_message, get_leader
+    name = team_name(gid)
+    leader = get_leader(name)
+    text = update.message.text
+    reply_to = update.message.reply_to_message.text or ""
+
+    try:
+        response = await analyze_text_message(name, text, reply_to)
+        if response:
+            await update.message.reply_text(f"🤖 {response}")
+    except Exception as e:
+        logger.error("Error in text reply handler: %s", e)
 
 
 # ── Forwarded message handler ────────────────────────────────────────
@@ -752,8 +783,14 @@ def main():
     # Forwarded messages (private chat)
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forwarded))
 
-    # Photos from groups
+    # Photos from groups (screenshots + creatives)
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # Text replies to bot in groups (AI conversation)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.REPLY,
+        handle_group_text
+    ))
 
     # ── Scheduled jobs ──
     jq = app.job_queue

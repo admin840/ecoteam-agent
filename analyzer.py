@@ -1,7 +1,7 @@
 """
-AI-powered screenshot analyzer and budget verifier.
-Uses Claude Vision to extract numbers from screenshots
-and compares them with Google Sheet data.
+AI-powered Performance Marketing Manager.
+Uses Claude Vision to analyze screenshots, verify budgets,
+coach media buyers, and provide strategic recommendations.
 """
 import os
 import json
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 MASTER_SHEET_URL = os.environ.get("MASTER_SHEET_URL", "")
 
-# ── Team info with leaders and sheet mapping ─────────────────────────
+# ── Team info ────────────────────────────────────────────────────────
 TEAM_INFO = {
     "Kuwaitmall":  {"leader": "سمر",    "sheet_name": "Fordeal",    "sheet_id": "1ckXTIE5P0POiOmeDSnGHPlJqHOF9a9LiGOLwu8XHMxo"},
     "Meeven":      {"leader": "غرام",   "sheet_name": "Meveen",     "sheet_id": "13SYsxvgLVDkVlZ1y1UnwngDVxn6wr91xwI_9eG3FZE4"},
@@ -31,22 +31,59 @@ TEAM_INFO = {
     "Deelat":      {"leader": "مريم",   "sheet_name": "Deelat",     "sheet_id": "19w3gqsL7vNh_XyBuBf-ZMhvEBFWiQGSV0yY2BBzOYxM"},
 }
 
-# Decision thresholds (same as Google Apps Script)
+# Decision thresholds
 CPO_GREEN = 150
 CPO_YELLOW = 180
 CPA_GREEN = 150
 CPA_YELLOW = 180
-CANCEL_RED = 30  # percent
+CANCEL_RED = 30
+
+# ── Performance Marketing Manager System Prompt ──────────────────────
+SYSTEM_PROMPT = """أنت مدير تسويق رقمي (Performance Marketing Manager) خبير، اسمك "EcoBot".
+شغال مع فريق إعلانات بيشتغل على Facebook Ads و TikTok Ads لمتاجر إلكترونية في الكويت.
+
+## خبراتك:
+- 10+ سنين في Performance Marketing و Paid Media
+- خبير في Facebook Ads Manager و TikTok Ads
+- تحليل البيانات والـ KPIs (CPO, CPA, ROAS, CTR, CVR)
+- إدارة البادجيت وتوزيعه على الحملات
+- تحسين الـ Creatives والـ Ad Copy
+- استراتيجيات الـ Scaling والـ Testing
+
+## طريقة شغلك:
+1. بتحلل كل screenshot بعمق مش بس أرقام - بتفهم السياق
+2. بتقارن مع البيانات في الشيت وتكتشف أي تلاعب أو خطأ
+3. لو في مشكلة بتسأل أسئلة ذكية عشان تفهم السبب
+4. بتدي نصايح عملية ومحددة مش كلام عام
+5. بتطلب معلومات إضافية لو محتاج (شيت الإعلانات، الـ Creative، breakdown)
+6. بتطور الـ Media Buyer وتعلمه يفكر صح
+
+## قواعد المراجعة:
+- كل المبالغ بالجنيه المصري (EGP)
+- CPO أخضر ≤ 150 | أصفر ≤ 180 | أحمر > 180
+- CPA أخضر ≤ 150 | أصفر ≤ 180 | أحمر > 180
+- Cancel Rate أحمر ≥ 30%
+- فرق أكتر من 10% في الـ Spend = مشكلة لازم تتراجع
+- الدفع بطريقتين: فواتير (مديونية) أو أكواد فوري (رصيد مسبق)
+
+## أسلوبك:
+- مباشر وعملي - مش بتلف وتدور
+- بتخاطب التيم ليدر بالاسم
+- لو الأرقام تمام بتشجع وتمدح
+- لو في مشكلة بتوضح إيه المشكلة وإيه الحل
+- بتسأل أسئلة تخلي الـ Media Buyer يفكر ويتعلم
+- ردك قصير ومختصر - مش مقال
+
+## لغة الرد:
+رد دايماً بالعربي (مصري). مختصر ومفيد."""
 
 
 def get_leader(team_name: str) -> str:
-    """Get team leader name."""
     info = TEAM_INFO.get(team_name, {})
     return info.get("leader", "")
 
 
 def get_sheet_name(team_name: str) -> str:
-    """Get the sheet/group name used in Master Sheet."""
     info = TEAM_INFO.get(team_name, {})
     return info.get("sheet_name", team_name)
 
@@ -54,7 +91,6 @@ def get_sheet_name(team_name: str) -> str:
 async def fetch_master_data() -> list[dict]:
     """Fetch all data from the Master Sheet via Web App."""
     if not MASTER_SHEET_URL:
-        logger.warning("MASTER_SHEET_URL not set")
         return []
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -62,107 +98,65 @@ async def fetch_master_data() -> list[dict]:
             data = resp.json()
             if data.get("success"):
                 return data.get("data", [])
-            logger.error("Master sheet error: %s", data.get("error"))
     except Exception as e:
         logger.error("Failed to fetch master data: %s", e)
     return []
 
 
 def get_team_today_data(all_data: list[dict], team_name: str) -> dict | None:
-    """Get today's data for a specific team from Master Sheet."""
+    """Get latest data for a team from Master Sheet."""
     sheet_name = get_sheet_name(team_name)
-    today_str = datetime.now().strftime("%d/%m/%Y")
-
-    # Try today first, then yesterday (in case data not updated yet)
-    for row in reversed(all_data):
-        if row.get("المجموعة") == sheet_name:
-            return row
-
-    # If not found by exact date, get latest for this team
     for row in reversed(all_data):
         if row.get("المجموعة") == sheet_name:
             return row
     return None
 
 
+def get_team_history(all_data: list[dict], team_name: str, days: int = 7) -> list[dict]:
+    """Get last N days of data for a team."""
+    sheet_name = get_sheet_name(team_name)
+    rows = [r for r in all_data if r.get("المجموعة") == sheet_name]
+    return rows[-days:] if len(rows) > days else rows
+
+
 async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: str) -> dict:
-    """
-    Use Claude Vision to analyze a screenshot and extract numbers.
-    Returns dict with extracted data and analysis.
-    """
+    """Use Claude Vision to extract numbers from screenshot."""
     if not CLAUDE_API_KEY:
         return {"error": "Claude API key not configured"}
 
     leader = get_leader(team_name)
-    sheet_name = get_sheet_name(team_name)
 
-    # Build the prompt based on report type
-    if report_type == "morning_sheet":
-        prompt = f"""أنت محلل بيانات لفريق إعلانات اسمه {team_name} (التيم ليدر: {leader}).
-هذه screenshot من شيت الطلبات اليومي (Google Sheets).
+    prompt = f"""أنت بتراجع screenshot من فريق {team_name} (التيم ليدر: {leader}).
+نوع التقرير: {report_type}
 
-استخرج الأرقام التالية بالجنيه المصري:
-- Spend (المصروف الإعلاني اليوم)
-- Orders (عدد الطلبات الجديدة)
-- Delivered (عدد الطلبات تم التسليم)
-- Cancel (عدد الطلبات الكانسل)
-- Hold (عدد الطلبات المعلقة)
-- التاريخ (لو موجود)
+استخرج كل الأرقام اللي تقدر تشوفها في الصورة دي.
+كل المبالغ بالجنيه المصري.
 
-رد بـ JSON فقط بالشكل ده:
-{{"spend": 0, "orders": 0, "delivered": 0, "cancel": 0, "hold": 0, "date": "", "notes": ""}}
+رد بـ JSON فقط بالشكل ده (حط null لأي رقم مش موجود):
+{{
+  "spend": null,
+  "orders": null,
+  "results": null,
+  "delivered": null,
+  "cancel": null,
+  "hold": null,
+  "cpo": null,
+  "cpa": null,
+  "budget": null,
+  "impressions": null,
+  "clicks": null,
+  "ctr": null,
+  "platform": null,
+  "account_name": null,
+  "campaign_names": [],
+  "date": null,
+  "notes": ""
+}}
 
-لو مش قادر تقرأ رقم حط null. لو لاحظت أي حاجة غريبة اكتبها في notes."""
-
-    elif report_type == "morning_budget":
-        prompt = f"""أنت محلل بيانات لفريق {team_name} (التيم ليدر: {leader}).
-هذه screenshot من داشبورد الإعلانات (Facebook Ads أو TikTok Ads).
-
-استخرج الأرقام التالية بالجنيه المصري:
-- Amount Spent / المبلغ المنفق (الـ Spend)
-- Results / النتائج (عدد الطلبات أو الـ conversions)
-- Cost per Result / تكلفة النتيجة (CPO)
-- Budget / الميزانية
-- اسم الحساب أو الحملة (لو موجود)
-
-رد بـ JSON فقط:
-{{"spend": 0, "results": 0, "cpo": 0, "budget": 0, "account_name": "", "platform": "", "notes": ""}}
-
-لو مش قادر تقرأ رقم حط null."""
-
-    elif report_type == "morning_dashboard":
-        prompt = f"""أنت محلل بيانات لفريق {team_name} (التيم ليدر: {leader}).
-هذه screenshot من داشبورد الإعلانات للفيسبوك أو التيك توك (بعد آخر طلب طلع الصبح).
-
-استخرج كل الأرقام المتاحة بالجنيه المصري:
-- Amount Spent / المبلغ المنفق
-- Results / النتائج
-- Cost per Result
-- Impressions / مرات الظهور
-- Clicks / النقرات
-- أي أرقام أخرى مهمة
-
-رد بـ JSON فقط:
-{{"spend": 0, "results": 0, "cpo": 0, "impressions": 0, "clicks": 0, "notes": ""}}"""
-
-    elif report_type == "afternoon":
-        prompt = f"""أنت محلل بيانات لفريق {team_name} (التيم ليدر: {leader}).
-هذه screenshot من تقرير الساعة 4 - الحساب الإعلاني أو البادجيت المصروف.
-
-استخرج الأرقام التالية بالجنيه المصري:
-- Amount Spent / المبلغ المنفق لحد الساعة 4
-- Results / عدد الطلبات لحد الساعة 4
-- Cost per Result
-- Budget المتبقي
-
-رد بـ JSON فقط:
-{{"spend": 0, "results": 0, "cpo": 0, "remaining_budget": 0, "notes": ""}}"""
-
-    else:
-        prompt = f"""أنت محلل بيانات لفريق {team_name}.
-استخرج كل الأرقام والبيانات المهمة من هذه الصورة.
-رد بـ JSON مع كل الأرقام اللي تقدر تستخرجها.
-كل المبالغ بالجنيه المصري."""
+ملاحظات مهمة:
+- لو الصورة فيها أكتر من حملة، اجمع الأرقام
+- لو شايف حاجة غريبة أو مش منطقية اكتبها في notes
+- لو الصورة مش واضحة أو مش screenshot إعلانات قول كده في notes"""
 
     try:
         client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
@@ -176,11 +170,7 @@ async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: st
                 "content": [
                     {
                         "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_b64,
-                        },
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
                     },
                     {"type": "text", "text": prompt},
                 ],
@@ -188,136 +178,188 @@ async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: st
         )
 
         response_text = message.content[0].text
-        # Try to parse JSON from response
-        # Handle case where Claude wraps in ```json ... ```
         cleaned = response_text.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1]
-            cleaned = cleaned.rsplit("```", 1)[0]
-        cleaned = cleaned.strip()
+            cleaned = cleaned.rsplit("```", 1)[0].strip()
 
         result = json.loads(cleaned)
-        result["raw_response"] = response_text
+        result["_raw"] = response_text
         return result
 
     except json.JSONDecodeError:
-        logger.warning("Could not parse JSON from Claude response")
-        return {"error": "Could not parse response", "raw_response": response_text}
+        return {"error": "parse_failed", "_raw": response_text}
     except Exception as e:
         logger.error("Claude API error: %s", e)
         return {"error": str(e)}
 
 
-async def compare_and_verify(team_name: str, screenshot_data: dict, report_type: str) -> str:
+async def smart_analysis(
+    team_name: str,
+    screenshot_data: dict,
+    report_type: str,
+    image_bytes: bytes | None = None,
+) -> str:
     """
-    Compare screenshot data with Master Sheet data.
-    Returns a smart analysis message in Arabic.
+    Full AI-powered analysis: compare with sheet, detect issues,
+    give coaching advice, request additional info if needed.
+    Returns the bot's message to send in the group.
     """
+    if not CLAUDE_API_KEY:
+        return ""
+
     leader = get_leader(team_name)
+
+    # Fetch sheet data for comparison
     all_data = await fetch_master_data()
-    sheet_data = get_team_today_data(all_data, team_name)
+    sheet_today = get_team_today_data(all_data, team_name)
+    history = get_team_history(all_data, team_name, days=5)
 
-    if not sheet_data:
-        return ""  # No sheet data to compare
+    # Build context for Claude
+    context_parts = [f"## فريق: {team_name} | التيم ليدر: {leader}"]
+    context_parts.append(f"## نوع التقرير: {report_type}")
+    context_parts.append(f"## التاريخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    lines = []
-    warnings = []
-    has_problem = False
+    # Screenshot data
+    context_parts.append(f"\n## بيانات الـ Screenshot:")
+    for k, v in screenshot_data.items():
+        if k.startswith("_") or v is None:
+            continue
+        context_parts.append(f"- {k}: {v}")
 
-    screenshot_spend = screenshot_data.get("spend")
-    sheet_spend = sheet_data.get("Spend اليوم", 0)
+    # Sheet data
+    if sheet_today:
+        context_parts.append(f"\n## بيانات الشيت (آخر تحديث):")
+        for k, v in sheet_today.items():
+            if v and v != "-" and v != "":
+                context_parts.append(f"- {k}: {v}")
 
-    screenshot_orders = screenshot_data.get("orders") or screenshot_data.get("results")
-    sheet_orders = sheet_data.get("Orders اليوم", 0)
+    # History
+    if history:
+        context_parts.append(f"\n## آخر {len(history)} أيام:")
+        for row in history[-3:]:
+            date = row.get("التاريخ", "?")
+            spend = row.get("Spend اليوم", 0)
+            orders = row.get("Orders اليوم", 0)
+            cpo = row.get("CPO اليوم", "-")
+            action = row.get("🚦 اليوم", "")
+            context_parts.append(f"  {date}: Spend={spend} | Orders={orders} | CPO={cpo} | {action}")
 
-    # ── Compare Spend ──
-    if screenshot_spend is not None and sheet_spend:
-        diff = abs(screenshot_spend - sheet_spend)
-        pct = (diff / sheet_spend * 100) if sheet_spend > 0 else 0
+    context_text = "\n".join(context_parts)
 
-        if pct > 10 and diff > 100:  # More than 10% difference and > 100 EGP
-            has_problem = True
-            warnings.append(
-                f"⚠️ الـ Spend في الداشبورد: {screenshot_spend:,.0f} جنيه\n"
-                f"   لكن في الشيت مسجل: {sheet_spend:,.0f} جنيه\n"
-                f"   فرق: {diff:,.0f} جنيه ({pct:.0f}%)"
-            )
-        elif pct > 5:
-            warnings.append(
-                f"🟡 فرق بسيط في الـ Spend: داشبورد {screenshot_spend:,.0f} / شيت {sheet_spend:,.0f}"
-            )
+    # Build the analysis prompt
+    analysis_prompt = f"""{context_text}
 
-    # ── Compare Orders ──
-    if screenshot_orders is not None and sheet_orders:
-        diff = abs(screenshot_orders - sheet_orders)
-        if diff > 2:  # More than 2 orders difference
-            has_problem = True
-            warnings.append(
-                f"⚠️ عدد الطلبات في الداشبورد: {screenshot_orders}\n"
-                f"   لكن في الشيت مسجل: {sheet_orders}\n"
-                f"   فرق: {diff} طلب"
-            )
+## المطلوب:
+بناءً على البيانات دي، اعمل تحليل سريع وذكي:
 
-    # ── Check CPO ──
-    if screenshot_spend and screenshot_orders and screenshot_orders > 0:
-        real_cpo = screenshot_spend / screenshot_orders
-        sheet_cpo = sheet_data.get("CPO اليوم", 0)
+1. **مراجعة الأرقام**: قارن أرقام الـ screenshot مع الشيت. لو في فرق أكتر من 10% في الـ Spend أو أكتر من 2 طلب - وضّح المشكلة واسأل {leader} عن السبب.
 
-        if real_cpo > CPO_YELLOW:
-            warnings.append(
-                f"🔴 CPO عالي: {real_cpo:.0f} جنيه/طلب (الحد: {CPO_YELLOW})\n"
-                f"   لازم تراجع الإعلان!"
-            )
-        elif real_cpo > CPO_GREEN:
-            warnings.append(
-                f"🟡 CPO محتاج مراقبة: {real_cpo:.0f} جنيه/طلب"
-            )
+2. **تحليل الأداء**: شوف الـ CPO والـ trends. هل الأداء بيتحسن ولا بيوحش؟
 
-        # Compare with sheet CPO
-        if sheet_cpo and isinstance(sheet_cpo, (int, float)) and sheet_cpo > 0:
-            cpo_diff = abs(real_cpo - sheet_cpo)
-            if cpo_diff > 20:
-                has_problem = True
-                warnings.append(
-                    f"⚠️ CPO في الداشبورد: {real_cpo:.0f} لكن في الشيت: {sheet_cpo}\n"
-                    f"   ده معناه الأرقام مش متطابقة!"
-                )
+3. **نصيحة عملية**: لو في مشكلة، قول إيه الحل. لو الأداء كويس، شجّع.
 
-    # ── Check for illogical numbers ──
-    if screenshot_spend is not None and screenshot_spend > 50000:
-        warnings.append(
-            f"🔍 الـ Spend عالي جداً: {screenshot_spend:,.0f} جنيه - تأكد إن ده الرقم الصح"
+4. **طلب معلومات إضافية**: لو محتاج تشوف:
+   - شيت الإعلانات النشطة (عشان تعرف أنهي حملة بتصرف أكتر)
+   - الـ Creative اللي شغال (عشان تحلل لو في مشكلة في الإعلان)
+   - Breakdown بالحملات (عشان تعرف أنهي حملة محتاجة تتوقف)
+   اطلبه بشكل واضح.
+
+5. **سؤال ذكي**: اسأل سؤال واحد يخلي الـ Media Buyer يفكر ويتعلم.
+
+## قواعد الرد:
+- خاطب {leader} بالاسم
+- رد مختصر (4-8 سطور ماكس)
+- لو كل حاجة تمام: سطرين مدح وخلاص
+- لو في مشكلة: وضّح المشكلة + الحل + اسأل
+- استخدم إيموجي بس متكترش
+- لو الأرقام في الـ screenshot مختلفة عن الشيت: ده أولوية قصوى"""
+
+    try:
+        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+
+        messages_content = [{"type": "text", "text": analysis_prompt}]
+
+        # Optionally include the image for deeper analysis
+        if image_bytes:
+            img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+            messages_content.insert(0, {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
+            })
+
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=800,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": messages_content}],
         )
 
-    if screenshot_orders is not None and screenshot_orders == 0 and screenshot_spend and screenshot_spend > 500:
-        warnings.append(
-            f"🚨 مصروف {screenshot_spend:,.0f} جنيه وصفر طلبات! في مشكلة كبيرة"
-        )
+        return message.content[0].text.strip()
 
-    # ── Build response ──
-    if not warnings:
-        return ""  # All good, no message needed
-
-    if has_problem:
-        lines.append(f"🔍 مراجعة تقرير {team_name} ({leader}):\n")
-        lines.extend(warnings)
-        lines.append(f"\n💬 {leader}، إيه تفسيرك؟")
-    else:
-        lines.append(f"📊 ملاحظات على تقرير {team_name}:\n")
-        lines.extend(warnings)
-
-    return "\n".join(lines)
+    except Exception as e:
+        logger.error("Smart analysis error: %s", e)
+        return ""
 
 
-async def generate_smart_summary(team_name: str, screenshot_data: dict) -> str:
-    """Generate a smart one-line summary of the screenshot data."""
+async def analyze_text_message(team_name: str, text: str, reply_to_text: str = "") -> str:
+    """
+    Handle text replies from team leaders.
+    The bot understands context and responds intelligently.
+    """
+    if not CLAUDE_API_KEY:
+        return ""
+
     leader = get_leader(team_name)
+
+    # Fetch recent data for context
+    all_data = await fetch_master_data()
+    sheet_today = get_team_today_data(all_data, team_name)
+
+    context = f"فريق: {team_name} | التيم ليدر: {leader}\n"
+    if sheet_today:
+        spend = sheet_today.get("Spend اليوم", 0)
+        orders = sheet_today.get("Orders اليوم", 0)
+        cpo = sheet_today.get("CPO اليوم", "-")
+        context += f"بيانات اليوم: Spend={spend} | Orders={orders} | CPO={cpo}\n"
+
+    prompt = f"""{context}
+
+الرسالة السابقة من البوت: "{reply_to_text}"
+
+رد التيم ليدر {leader}: "{text}"
+
+رد على {leader} كمدير تسويق ذكي:
+- لو بيفسر سبب الفرق في الأرقام: قيّم تفسيره - هل منطقي ولا لا
+- لو بيسأل سؤال: جاوبه بخبرة
+- لو بيقول هيصلح حاجة: شجعه وتابع
+- لو محتاج مساعدة: ساعده بنصيحة عملية
+- لو التفسير مش مقنع: اسأل أكتر أو اطلب proof
+
+رد مختصر (2-4 سطور). بالعربي المصري."""
+
+    try:
+        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return message.content[0].text.strip()
+
+    except Exception as e:
+        logger.error("Text analysis error: %s", e)
+        return ""
+
+
+def generate_quick_summary(screenshot_data: dict) -> str:
+    """Generate a quick one-line summary of extracted data."""
+    parts = []
     spend = screenshot_data.get("spend")
     orders = screenshot_data.get("orders") or screenshot_data.get("results")
     cpo = screenshot_data.get("cpo")
-    notes = screenshot_data.get("notes", "")
 
-    parts = []
     if spend is not None:
         parts.append(f"Spend: {spend:,.0f}")
     if orders is not None:
@@ -327,9 +369,4 @@ async def generate_smart_summary(team_name: str, screenshot_data: dict) -> str:
     elif spend and orders and orders > 0:
         parts.append(f"CPO: {spend/orders:,.0f}")
 
-    summary = " | ".join(parts) if parts else "تم استلام الصورة"
-
-    if notes:
-        summary += f"\n📝 {notes}"
-
-    return summary
+    return " | ".join(parts) if parts else "تم استلام الصورة"
