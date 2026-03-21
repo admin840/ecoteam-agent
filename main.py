@@ -250,12 +250,14 @@ async def followup_reminder(context: ContextTypes.DEFAULT_TYPE):
             photos = morning_photos if report_type == "morning" else afternoon_photos
             count = photos.get(gid, 0)
             name = team_name(gid)
+            from analyzer import get_leader as _gl
+            leader = _gl(name)
             await send_to_group(context, gid,
-                f"🚨 تنبيه: لم يكتمل التقرير ({count}/{required}) - سيتم خصم من الراتب")
+                f"⚠️ يا {leader}، للأسف تم تسجيل خصم يوم بسبب عدم إكمال {type_label}.\n"
+                f"لو عندك سبب أو اعتراض رد على الرسالة دي وهيتم تحويل الشكوى للمدير لإعادة النظر 🙏")
             await notify_owner(context,
-                f"🚨 {name} لم يكمل {type_label} ({count}/{required})")
+                f"🚨 {name} ({leader}) - خصم يوم: عدم إكمال {type_label} ({count}/{required})")
             save_deduction(name, f"عدم إكمال {type_label}")
-            await send_to_group(context, gid, "📝 تم تسجيل خصم بسبب عدم إرسال التقرير")
 
 
 def schedule_report_followups(context_or_jq, report_type: str):
