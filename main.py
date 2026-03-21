@@ -55,7 +55,9 @@ MORNING_REQUIRED = 3
 AFTERNOON_REQUIRED = 3
 
 # ── State tracking (persisted to file) ───────────────────────────────
-TRACKING_FILE = Path("daily_tracking.json")
+# Persistent storage: use /data volume on Railway, fallback to current dir
+_DATA_DIR = Path("/data") if Path("/data").exists() else Path(".")
+TRACKING_FILE = _DATA_DIR / "daily_tracking.json"
 
 
 def _load_tracking() -> dict:
@@ -156,7 +158,7 @@ def feedback_keyboard() -> InlineKeyboardMarkup:
     ])
 
 # ── Deductions file ──────────────────────────────────────────────────
-DEDUCTIONS_FILE = Path("deductions.json")
+DEDUCTIONS_FILE = _DATA_DIR / "deductions.json"
 
 
 def load_deductions() -> list[dict]:

@@ -119,7 +119,10 @@ def get_team_history(all_data: list[dict], team_name: str, days: int = 7) -> lis
 # PERSISTENT LEARNING MEMORY - bot learns from corrections
 # ══════════════════════════════════════════════════════════════════════
 
-LEARNINGS_FILE = Path("learnings.json")
+# Persistent storage: use /data volume on Railway, fallback to current dir
+DATA_DIR = Path("/data") if Path("/data").exists() else Path(".")
+
+LEARNINGS_FILE = DATA_DIR / "learnings.json"
 
 
 def load_learnings() -> list[dict]:
@@ -173,7 +176,7 @@ def get_learnings_for_prompt(team_name: str = "", last_n: int = 5) -> str:
 # IMAGE PATTERN MEMORY - bot learns image types from corrections
 # ══════════════════════════════════════════════════════════════════════
 
-IMAGE_PATTERNS_FILE = Path("image_patterns.json")
+IMAGE_PATTERNS_FILE = DATA_DIR / "image_patterns.json"
 
 
 def load_image_patterns() -> dict:
@@ -2032,7 +2035,7 @@ CPO/CPA: أخضر ≤ 150 | أصفر ≤ 180 | أحمر > 180
 # CREATIVE TRACKING - remember creatives and link to performance
 # ══════════════════════════════════════════════════════════════════════
 
-CREATIVE_HISTORY_FILE = Path("creative_history.json")
+CREATIVE_HISTORY_FILE = DATA_DIR / "creative_history.json"
 
 
 def load_creative_history() -> list[dict]:
@@ -2071,7 +2074,7 @@ def get_last_creative(team_name: str) -> dict | None:
 # BUDGET TRACKING - fawry codes + card payments
 # ══════════════════════════════════════════════════════════════════════
 
-BUDGET_FILE = Path("budget_tracking.json")
+BUDGET_FILE = DATA_DIR / "budget_tracking.json"
 
 
 def load_budget_data() -> list[dict]:
