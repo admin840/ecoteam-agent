@@ -259,22 +259,18 @@ async def auto_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
         count = morning_photos.get(gid, 0)
 
         if count >= MORNING_REQUIRED:
-            # Already done - thank them!
             already_done += 1
             await send_to_group(context, gid,
-                f"صباح الخير يا {leader}! 🌅\nتقريرك مكتمل ✅ شكراً إنك بعتي بدري 💪")
+                f"صباح الخير يا {leader}! 🌅\nتقريرك مكتمل ✅ شكراً إنك بعتت بدري 💪")
         elif count > 0:
-            # Partially done - tell them what's missing
             partial += 1
             missing = MORNING_REQUIRED - count
             await send_to_group(context, gid,
                 f"صباح الخير يا {leader}! 🌅\n"
-                f"بعت {count} من {MORNING_REQUIRED} - ناقصك {missing} screenshots:\n"
-                f"{'2️⃣ البادجيت المصروف (Facebook/TikTok)' if count < 2 else ''}\n"
-                f"{'3️⃣ داشبورد الإعلانات' if count < 3 else ''}\n"
-                f"شكراً 🙏")
+                f"أنا وصلني {count} صور من التقرير - شكراً ليك 🙏\n"
+                f"لو في حاجة تانية ممكن تبعتها تاني عشان أشوفها؟\n"
+                f"المطلوب {MORNING_REQUIRED} screenshots (شيت + بادجيت + داشبورد)")
         else:
-            # Nothing sent - full reminder
             sent_count += 1
             await send_to_group(context, gid, MORNING_MSG)
 
@@ -306,11 +302,11 @@ async def auto_afternoon_reminder(context: ContextTypes.DEFAULT_TYPE):
                 f"مساء الخير يا {leader}! 🌇\nتقرير العصر مكتمل ✅ شكراً 💪")
         elif count > 0:
             partial += 1
-            missing = AFTERNOON_REQUIRED - count
             await send_to_group(context, gid,
                 f"مساء الخير يا {leader}! 🌇\n"
-                f"بعت {count} من {AFTERNOON_REQUIRED} - ناقصك {missing} screenshots\n"
-                f"شكراً 🙏")
+                f"أنا وصلني {count} صور - شكراً ليك 🙏\n"
+                f"لو في حاجة تانية ممكن تبعتها تاني عشان أشوفها؟\n"
+                f"المطلوب {AFTERNOON_REQUIRED} screenshots")
         else:
             sent_count += 1
             await send_to_group(context, gid, AFTERNOON_MSG)
