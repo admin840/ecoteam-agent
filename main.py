@@ -1088,34 +1088,17 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
     text = update.message.text
 
+    from analyzer import analyze_text_message, save_learning, get_leader, remember_exchange
+    name = team_name(gid)
+    leader = get_leader(name)
+
     # ── Owner talking in group → bot watches silently ──
     if user_id == OWNER_CHAT_ID:
-        from analyzer import remember_exchange
-        name = team_name(gid)
-        # Just observe and remember, don't reply
         remember_exchange(name, "", user_reply=f"[المالك]: {text[:200]}")
         return
 
-    # ── "محتاج البوت" or mention → bot joins conversation ──
-    bot_invited = any(w in text for w in ["محتاج البوت", "يا بوت", "EcoBot", "ecobot", "/bot"])
-
-    # ── Normal reply to bot's message ──
-    is_reply_to_bot = False
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        bot_user = await context.bot.get_me()
-        is_reply_to_bot = update.message.reply_to_message.from_user.id == bot_user.id
-
-    if not is_reply_to_bot and not bot_invited:
-        return  # Not talking to the bot
-
-    from analyzer import analyze_text_message, save_learning, get_leader
-    name = team_name(gid)
-    leader = get_leader(name)
-    reply_to = ""
-    if update.message.reply_to_message:
-        reply_to = update.message.reply_to_message.text or ""
-
-    # ── Check if this is an image type correction ──
+    # ── PRIORITY: Check if bot is waiting for a correction FIRST ──
+    # (accept ANY message from the group, not just replies)
     waiting_imgtype = context.chat_data.get("waiting_imgtype_correction", False)
     if waiting_imgtype:
         from analyzer import save_image_pattern, save_learning
@@ -1132,15 +1115,29 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting = context.chat_data.get("waiting_correction", False)
     if waiting:
         wrong_analysis = context.chat_data.get("wrong_analysis", "")
-        # Save the correction as a learning
         save_learning(name, "correction", wrong_analysis, text)
         context.chat_data["waiting_correction"] = False
         context.chat_data["wrong_analysis"] = ""
         await update.message.reply_text(
-            f"✅ اتعلمت يا {leader}! شكراً جداً على التصحيح.\n"
-            f"مش هكرر الغلطة دي تاني إن شاء الله 💪"
+            f"✅ اتعلمت يا {leader}! شكراً جداً على التوضيح.\n"
+            f"المرة الجاية هاخد ده في الاعتبار إن شاء الله 💪"
         )
         return
+
+    # ── Now check if the message is directed at the bot ──
+    bot_invited = any(w in text for w in ["محتاج البوت", "يا بوت", "EcoBot", "ecobot", "/bot"])
+
+    is_reply_to_bot = False
+    if update.message.reply_to_message and update.message.reply_to_message.from_user:
+        bot_user = await context.bot.get_me()
+        is_reply_to_bot = update.message.reply_to_message.from_user.id == bot_user.id
+
+    if not is_reply_to_bot and not bot_invited:
+        return  # Not talking to the bot
+
+    reply_to = ""
+    if update.message.reply_to_message:
+        reply_to = update.message.reply_to_message.text or ""
 
     try:
         response = await analyze_text_message(name, text, reply_to)
