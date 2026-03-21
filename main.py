@@ -690,7 +690,12 @@ async def afternoon_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    from analyzer import get_leader
+
+    # Step 1: Show working indicator
+    loading_msg = await update.message.reply_text("⏳ جاري مراجعة كل الشيتات والبيانات...")
+
+    from analyzer import get_leader, fetch_team_sheet, get_team_sheet_today, _safe_num
+
     today = now_egypt().strftime("%d/%m")
     t = now_egypt().strftime("%I:%M%p")
 
@@ -698,21 +703,43 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     partial_list = []
     missing_list = []
 
+    # Step 2: Check ALL sources for each team
     for gid, name in TEAMS.items():
         leader = get_leader(name)
         paused = " ⏸" if gid in paused_teams else ""
 
+        # Source 1: Photo tracking (what screenshots were sent)
         m_received = get_received_categories(gid, "morning")
         m_missing = get_missing_categories(gid, "morning")
 
+        # Source 2: Team sheet (is it updated today?)
+        sheet_status = ""
+        try:
+            rows = await fetch_team_sheet(name)
+            today_row = get_team_sheet_today(rows) if rows else None
+            if today_row:
+                spend = _safe_num(today_row.get("Spend", ""))
+                orders = _safe_num(today_row.get("New Orders", ""))
+                cpo = _safe_num(today_row.get("CPO", ""))
+                sheet_status = f" | 📋 Spend:{spend:,.0f} Orders:{orders:.0f}"
+                if cpo and cpo > 0:
+                    emoji = "🟢" if cpo <= 150 else "🟡" if cpo <= 180 else "🔴"
+                    sheet_status += f" CPO:{cpo:.0f}{emoji}"
+            else:
+                sheet_status = " | 📋 الشيت لسه"
+        except Exception:
+            sheet_status = ""
+
         if not m_missing:
-            done_list.append(f"  ✅ {name} ({leader}){paused}")
+            done_list.append(f"  ✅ {name} ({leader}){sheet_status}{paused}")
         elif m_received:
             received_short = ", ".join(m_received)
-            partial_list.append(f"  🟡 {name} ({leader}) - وصل: {received_short}{paused}")
+            done_count = 3 - len(m_missing)
+            partial_list.append(f"  🟡 {name} ({leader}) [{done_count}/3]{sheet_status}{paused}")
         else:
-            missing_list.append(f"  ❌ {name} ({leader}){paused}")
+            missing_list.append(f"  ❌ {name} ({leader}){sheet_status}{paused}")
 
+    # Step 3: Build verified response
     lines = [f"📊 حالة الفرق  {today} {t}\n"]
 
     if done_list:
@@ -728,9 +755,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.extend(missing_list)
         lines.append("")
 
-    lines.append(f"الصبح: مكتمل {len(done_list)} | ناقص {len(partial_list)} | لم يبدأ {len(missing_list)}")
+    lines.append(f"الصبح: ✅{len(done_list)} | 🟡{len(partial_list)} | ❌{len(missing_list)}")
 
-    await update.message.reply_text("\n".join(lines))
+    # Replace loading message with actual result
+    await loading_msg.edit_text("\n".join(lines))
 
 
 async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -743,6 +771,7 @@ async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
+    await update.message.reply_text("⏳ جاري جمع البيانات من كل الشيتات وتحليلها...")
     await daily_noon_report(context)
     await update.message.reply_text("✅ تم إرسال الملخص اليومي.")
 
@@ -763,7 +792,7 @@ async def compare_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = int(query.data.replace("team_", ""))
     name = team_name(gid)
 
-    await query.edit_message_text(f"⏳ جاري تحليل بيانات {name}...")
+    await query.edit_message_text(f"⏳ جاري مراجعة شيت {name} + الشيت المجمع + الصور...")
 
     from analyzer import fetch_master_data, get_team_today_data, get_team_history, get_leader
 
