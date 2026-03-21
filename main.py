@@ -336,6 +336,8 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     """Midnight Egypt - reset daily tracking."""
     morning_photos.clear()
     afternoon_photos.clear()
+    from analyzer import reset_conversation_memory
+    reset_conversation_memory()
     logger.info("Daily tracking reset (Egypt midnight)")
 
 
@@ -758,7 +760,7 @@ async def pause_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Photo handler: AI analysis
+# Photo handler: classify first, then act accordingly
 # ══════════════════════════════════════════════════════════════════════
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
@@ -768,53 +770,76 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from analyzer import (
         analyze_screenshot, smart_analysis,
         generate_quick_summary, get_leader,
+        handle_non_report_image,
     )
 
     name = team_name(gid)
     leader = get_leader(name)
     hour = now_egypt().hour
 
-    # Track count and determine report type
+    # Download the image first
+    try:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = bytes(await file.download_as_bytearray())
+    except Exception as e:
+        logger.error("Photo download error (%s): %s", name, e)
+        return
+
+    # Step 1: Classify + extract (analyze_screenshot now classifies first)
+    report_type = "morning" if hour < 16 else "afternoon"
+    try:
+        result = await analyze_screenshot(image_bytes, name, report_type)
+    except Exception as e:
+        logger.error("Photo analysis error (%s): %s", name, e)
+        return
+
+    img_type = result.get("image_type", "other")
+
+    # Step 2: Handle based on image type
+    if img_type in ("payment_receipt", "creative_image", "other"):
+        # NOT a report screenshot - don't count it, respond appropriately
+        try:
+            response = await handle_non_report_image(
+                image_bytes, name, img_type, result.get("description", "")
+            )
+            if response:
+                await update.message.reply_text(f"🤖 {response}")
+        except Exception as e:
+            logger.error("Non-report image error (%s): %s", name, e)
+        return  # Don't count, don't analyze further
+
+    # Step 3: It's a report screenshot - count it
     if hour < 16:
         count = morning_photos.get(gid, 0) + 1
         morning_photos[gid] = count
         required = MORNING_REQUIRED
-        report_types = {1: "morning_sheet", 2: "morning_budget", 3: "morning_dashboard"}
-        report_type = report_types.get(count, "morning_sheet")
-        if count <= required:
-            await update.message.reply_text(f"📸 تقرير الصبح: ({count}/{required})")
     else:
         count = afternoon_photos.get(gid, 0) + 1
         afternoon_photos[gid] = count
         required = AFTERNOON_REQUIRED
-        report_type = "afternoon"
-        if count <= required:
-            await update.message.reply_text(f"📸 تقرير العصر: ({count}/{required})")
 
-    # AI Analysis
-    try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        image_bytes = await file.download_as_bytearray()
+    period = "الصبح" if hour < 16 else "العصر"
 
-        result = await analyze_screenshot(bytes(image_bytes), name, report_type)
-        if "error" not in result:
-            summary = generate_quick_summary(result)
-            await update.message.reply_text(f"🤖 {summary}")
+    # Step 4: Quick summary + smart analysis (one combined message)
+    if "error" not in result:
+        summary = generate_quick_summary(result)
 
-            analysis = await smart_analysis(name, result, report_type, bytes(image_bytes))
-            if analysis:
-                await update.message.reply_text(analysis)
-                if any(w in analysis for w in ["⚠️", "🔴", "🚨", "فرق", "مشكلة"]):
-                    await notify_owner(context, f"🔍 تنبيه - {name}:\n{analysis}")
-    except Exception as e:
-        logger.error("Photo analysis error (%s): %s", name, e)
+        analysis = await smart_analysis(name, result, report_type, image_bytes)
+        if analysis:
+            # Send count + analysis in one message
+            header = f"📸 تقرير {period}: ({count}/{required})\n🤖 {summary}\n\n"
+            await update.message.reply_text(header + analysis)
+            if any(w in analysis for w in ["⚠️", "🔴", "🚨", "فرق", "مشكلة"]):
+                await notify_owner(context, f"🔍 تنبيه - {name}:\n{analysis}")
+        else:
+            await update.message.reply_text(f"📸 تقرير {period}: ({count}/{required})\n🤖 {summary}")
+    else:
+        await update.message.reply_text(f"📸 تقرير {period}: ({count}/{required})")
 
-    # Completion
-    if hour < 16 and count == required:
-        await update.message.reply_text(f"✅ تقرير الصبح مكتمل! شكراً {leader} 🎉")
-    elif hour >= 16 and count == required:
-        await update.message.reply_text(f"✅ تقرير العصر مكتمل! شكراً {leader} 🎉")
+    # Step 5: Completion message
+    if count == required:
+        await update.message.reply_text(f"✅ تقرير {period} مكتمل! شكراً {leader} 🎉")
 
 
 # ══════════════════════════════════════════════════════════════════════
