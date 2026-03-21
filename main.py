@@ -771,6 +771,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         analyze_screenshot, smart_analysis,
         generate_quick_summary, get_leader,
         handle_non_report_image,
+        REPORT_IMAGE_TYPES,
     )
 
     name = team_name(gid)
@@ -797,7 +798,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     img_type = result.get("image_type", "other")
 
     # Step 2: Handle based on image type
-    if img_type in ("payment_receipt", "creative_image", "other"):
+    if img_type not in REPORT_IMAGE_TYPES:
         # NOT a report screenshot - don't count it, respond appropriately
         try:
             response = await handle_non_report_image(

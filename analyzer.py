@@ -156,14 +156,15 @@ def verify_screenshot_vs_sheet(screenshot_data: dict, sheet_data: dict | None) -
     status: 'match' | 'minor_diff' | 'major_diff' | 'no_sheet_data'
     """
     if not sheet_data:
-        return {"status": "no_sheet_data", "discrepancies": [], "summary": "مفيش بيانات في الشيت للمقارنة"}
+        return {"status": "no_sheet_data", "discrepancies": [], "summary": "الشيت لسه مش متحدث"}
 
     discrepancies = []
 
-    # Compare Spend
+    # Compare Spend - only when BOTH have real numbers
     ss_spend = _safe_num(screenshot_data.get("spend"))
     sh_spend = _safe_num(sheet_data.get("Spend اليوم"))
-    if ss_spend is not None and sh_spend is not None and sh_spend > 0:
+    if ss_spend is not None and ss_spend > 0 and sh_spend is not None and sh_spend > 0:
+        # Both have real values - compare them
         diff_pct = abs(ss_spend - sh_spend) / sh_spend * 100
         if diff_pct > 10:
             discrepancies.append({
@@ -181,11 +182,13 @@ def verify_screenshot_vs_sheet(screenshot_data: dict, sheet_data: dict | None) -
                 "diff_pct": round(diff_pct, 1),
                 "severity": "minor",
             })
+    # If sheet is 0 but screenshot has data = sheet not updated yet (NOT a problem)
 
-    # Compare Orders
+    # Compare Orders - only when BOTH have real numbers
     ss_orders = _safe_num(screenshot_data.get("orders") or screenshot_data.get("results"))
     sh_orders = _safe_num(sheet_data.get("Orders اليوم"))
-    if ss_orders is not None and sh_orders is not None:
+    if ss_orders is not None and ss_orders > 0 and sh_orders is not None and sh_orders > 0:
+        # Both have real values - compare them
         diff = abs(ss_orders - sh_orders)
         if diff > 2:
             discrepancies.append({
@@ -203,11 +206,12 @@ def verify_screenshot_vs_sheet(screenshot_data: dict, sheet_data: dict | None) -
                 "diff": diff,
                 "severity": "minor",
             })
+    # If sheet is 0 but screenshot has orders = sheet not updated yet (NOT a problem)
 
-    # Compare CPO
+    # Compare CPO - only when BOTH have real numbers
     ss_cpo = _safe_num(screenshot_data.get("cpo"))
     sh_cpo = _safe_num(sheet_data.get("CPO اليوم"))
-    if ss_cpo is not None and sh_cpo is not None and sh_cpo > 0:
+    if ss_cpo is not None and ss_cpo > 0 and sh_cpo is not None and sh_cpo > 0:
         diff_pct = abs(ss_cpo - sh_cpo) / sh_cpo * 100
         if diff_pct > 15:
             discrepancies.append({
@@ -221,6 +225,19 @@ def verify_screenshot_vs_sheet(screenshot_data: dict, sheet_data: dict | None) -
     # Determine overall status
     has_major = any(d["severity"] == "major" for d in discrepancies)
     has_minor = any(d["severity"] == "minor" for d in discrepancies)
+
+    # Check if sheet seems empty/not updated
+    sh_spend_val = _safe_num(sheet_data.get("Spend اليوم"))
+    sh_orders_val = _safe_num(sheet_data.get("Orders اليوم"))
+    sheet_is_empty = (not sh_spend_val or sh_spend_val == 0) and (not sh_orders_val or sh_orders_val == 0)
+
+    if sheet_is_empty and (ss_spend or ss_orders):
+        # Sheet not updated yet - this is normal, NOT a problem
+        return {
+            "status": "sheet_not_updated",
+            "discrepancies": [],
+            "summary": "📋 الشيت لسه مش متحدث لليوم ده - ده عادي",
+        }
 
     if has_major:
         status = "major_diff"
@@ -523,41 +540,66 @@ SYSTEM_PROMPT = """أنت مدير تسويق رقمي (Performance Marketing Ma
 
 # Valid image types the bot understands
 IMAGE_TYPES = {
-    "ads_dashboard":    "screenshot من Ads Manager أو TikTok Ads (حملات، أرقام، spend)",
-    "order_sheet":      "شيت الطلبات اليومي (Google Sheets) فيه طلبات وأرقام",
-    "budget_sheet":     "شيت البادجيت أو أكواد فوري",
-    "payment_receipt":  "إيصال دفع أو payment activity أو فاتورة",
-    "creative_image":   "إعلان (صورة creative) - مش screenshot أرقام",
-    "other":            "صورة تانية مش مرتبطة بالتقارير",
+    "fb_ads_dashboard":  "داشبورد حملات Facebook Ads Manager (campaigns, ad sets, spend, results)",
+    "tt_ads_dashboard":  "داشبورد حملات TikTok Ads (campaigns, spend, conversions)",
+    "fb_payment":        "صفحة دفع/billing/payment من فيسبوك (فواتير، prepaid، payment activity)",
+    "tt_payment":        "صفحة دفع/billing/payment من تيك توك (فواتير، prepaid، payment activity)",
+    "order_sheet":       "شيت الطلبات اليومي (Google Sheets) فيه طلبات وأرقام",
+    "budget_sheet":      "شيت البادجيت أو أكواد فوري",
+    "creative_image":    "إعلان (صورة/فيديو creative) مصممة للنشر",
+    "other":             "صورة تانية مش مرتبطة بالتقارير",
 }
+
+# Which types count as report screenshots
+REPORT_IMAGE_TYPES = {"fb_ads_dashboard", "tt_ads_dashboard", "order_sheet", "budget_sheet"}
+# Which types are payment/billing (acknowledge only)
+PAYMENT_IMAGE_TYPES = {"fb_payment", "tt_payment"}
 
 
 async def classify_image(image_bytes: bytes) -> dict:
     """
     Step 1: Classify the image BEFORE doing anything else.
-    Returns: {type, confidence, description}
+    Returns: {type, confidence, description, platform}
     """
     if not CLAUDE_API_KEY:
         return {"type": "other", "confidence": 0, "description": ""}
 
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    prompt = """شوف الصورة دي وقولي نوعها. رد بـ JSON فقط:
+    prompt = """أنت خبير في التسويق الرقمي. شوف الصورة دي وحدد نوعها بدقة.
+
+رد بـ JSON فقط:
 {
   "type": "...",
   "confidence": 0.0,
-  "description": "وصف قصير جداً لمحتوى الصورة"
+  "platform": "facebook|tiktok|google_sheets|other",
+  "description": "وصف قصير لمحتوى الصورة بالعربي"
 }
 
-الأنواع المتاحة:
-- "ads_dashboard" = screenshot من Facebook Ads Manager أو TikTok Ads فيه حملات وأرقام spend/results/impressions
-- "order_sheet" = شيت طلبات (Google Sheets) فيه أرقام طلبات يومية
-- "budget_sheet" = شيت بادجيت أو أكواد فوري أو رصيد
-- "payment_receipt" = إيصال دفع أو payment activity أو فاتورة أو transaction
-- "creative_image" = إعلان أو creative (صورة منتج/عرض مصممة للإعلان)
-- "other" = أي حاجة تانية (صورة شخصية، chat، حاجة مش مرتبطة)
+## الأنواع - اختار واحد بس:
 
-confidence: رقم من 0.0 لـ 1.0 بيوضح أد إيه أنت متأكد"""
+### داشبوردات الإعلانات (فيها حملات وأرقام أداء):
+- "fb_ads_dashboard" = صفحة Facebook Ads Manager فيها قائمة حملات campaigns أو ad sets مع أرقام أداء (spend, results, impressions, reach, CPC, CPM). بتبان فيها جدول الحملات وأسماءها وحالتها (active/paused).
+- "tt_ads_dashboard" = صفحة TikTok Ads Manager فيها حملات أو ad groups مع أرقام (cost, conversions, impressions). شكل TikTok مختلف عن فيسبوك.
+
+### صفحات الدفع/الفواتير (مش فيها حملات - فيها فلوس ودفع):
+- "fb_payment" = صفحة billing أو payment settings أو payment activity من فيسبوك. بتبان فيها: invoices, payment method, prepaid balance, transactions, أو "Paid" status. مفيهاش حملات.
+- "tt_payment" = صفحة billing أو payment من تيك توك. بتبان فيها: balance, top up, transactions, payment history. مفيهاش حملات.
+
+### شيتات (Google Sheets):
+- "order_sheet" = شيت Google Sheets فيه جدول طلبات يومية (تاريخ، طلبات، delivered، cancel، hold). بيبان عليه شكل Google Sheets.
+- "budget_sheet" = شيت بادجيت أو أكواد فوري أو رصيد. بيبان عليه شكل Google Sheets.
+
+### غيره:
+- "creative_image" = صورة إعلان أو creative مصممة (صورة منتج، عرض، بانر). مش screenshot من منصة.
+- "other" = أي حاجة تانية مش من اللي فوق.
+
+## الفرق المهم:
+- صفحة الدفع (payment/billing) ≠ داشبورد الحملات (campaigns)
+- صفحة الدفع بتبين فواتير ومبالغ مدفوعة - مفيهاش أسماء حملات أو نتائج إعلانية
+- داشبورد الحملات بتبين campaigns وأرقام أداء (spend, results, impressions)
+- لو الصورة فيها كلمة "Payment" أو "Billing" أو "Invoice" أو "Prepaid" = payment
+- لو الصورة فيها كلمة "Campaigns" أو "Ad Sets" أو "Results" أو "Impressions" = dashboard"""
 
     try:
         client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
@@ -607,10 +649,11 @@ async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: st
     img_desc = classification.get("description", "")
 
     # For non-report images, return early with classification info
-    if img_type in ("payment_receipt", "other", "creative_image"):
+    if img_type not in REPORT_IMAGE_TYPES:
         return {
             "image_type": img_type,
             "description": img_desc,
+            "platform": classification.get("platform", ""),
             "notes": img_desc,
             "_classified": True,
         }
@@ -701,17 +744,23 @@ async def handle_non_report_image(
     leader = get_leader(team_name)
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
+    # Payment instructions - same for FB and TikTok
+    payment_instruction = f"""الصورة دي صفحة دفع/billing.
+
+رد بسطر واحد بس. مثال: "تم ✅ إيصال دفع 4,806 جنيه"
+- اقرأ المبلغ من الصورة لو واضح
+- متحللش أي حاجة تانية
+- متسألش أسئلة
+- متربطش بالـ spend أو بالشيت أو بالحملات
+- ده صفحة دفع عادية
+
+خاطب {leader} بالاسم. سطر واحد فقط."""
+
     type_instructions = {
-        "payment_receipt": f"""الصورة دي إيصال دفع أو payment activity.
-
-رد بسطر واحد بس: "تم ✅ إيصال دفع [المبلغ لو واضح]"
-متحللش. متسألش أسئلة. متربطش بالـ spend أو الشيت.
-ده إيصال دفع عادي مش screenshot إعلانات.
-
-خاطب {leader} بالاسم. سطر واحد فقط.""",
+        "fb_payment": payment_instruction,
+        "tt_payment": payment_instruction,
 
         "creative_image": f"""الصورة دي creative أو إعلان مصمم.
-وصف: {description}
 
 حلل الـ Creative بسرعة:
 - التصميم كويس؟
@@ -721,13 +770,9 @@ async def handle_non_report_image(
 
 خاطب {leader} بالاسم. 3-4 سطور ماكس.""",
 
-        "other": f"""الصورة دي مش screenshot تقرير ومش إعلان.
-وصف: {description}
-
-لو الصورة مش مرتبطة بالشغل: قول "تم استلام الصورة" بس.
-لو فيها حاجة مرتبطة بالشغل: علّق عليها باختصار.
-
-خاطب {leader} بالاسم. سطر واحد بس.""",
+        "other": f"""رد بسطر واحد: "تم استلام الصورة ✅"
+متحللش ومتسألش.
+خاطب {leader} بالاسم.""",
     }
 
     prompt = type_instructions.get(image_type, type_instructions["other"])
