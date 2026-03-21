@@ -714,25 +714,30 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m_received = get_received_categories(gid, "morning")
         m_missing = get_missing_categories(gid, "morning")
 
-        # Source 2: Team sheet (is it updated today?) - PRIMARY source of truth
+        # Source 2: Team sheet (PRIMARY source of truth)
         sheet_updated = False
         sheet_status = ""
         try:
             rows = await fetch_team_sheet(name)
+            logger.info("/status: %s - fetched %d rows", name, len(rows) if rows else 0)
             today_row = get_team_sheet_today(rows) if rows else None
             if today_row:
                 sheet_updated = True
                 spend = _safe_num(today_row.get("Spend", ""))
                 orders = _safe_num(today_row.get("New Orders", ""))
                 cpo = _safe_num(today_row.get("CPO", ""))
-                sheet_status = f"\n     📋 Spend:{spend:,.0f} | Orders:{orders:.0f}"
+                date = today_row.get("Date", "?")
+                logger.info("/status: %s - today=%s spend=%s orders=%s", name, date, spend, orders)
+                sheet_status = f"\n     📋 [{date}] Spend:{spend:,.0f} | Orders:{orders:.0f}"
                 if cpo and cpo > 0:
                     emoji = "🟢" if cpo <= 150 else "🟡" if cpo <= 180 else "🔴"
                     sheet_status += f" | CPO:{cpo:.0f}{emoji}"
             else:
-                sheet_status = "\n     📋 الشيت لسه"
-        except Exception:
-            sheet_status = ""
+                logger.info("/status: %s - no today row found", name)
+                sheet_status = "\n     📋 الشيت لسه مش متحدث"
+        except Exception as e:
+            logger.error("/status: %s - sheet error: %s", name, e)
+            sheet_status = "\n     📋 ⚠️ مش قادر أقرأ الشيت"
 
         # Determine status: use BOTH sources
         if not m_missing:
