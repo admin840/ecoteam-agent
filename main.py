@@ -438,27 +438,19 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     from analyzer import get_leader
-    today = now_egypt().strftime("%d/%m/%Y")
-    t = now_egypt().strftime("%I:%M %p")
-
-    lines = [
-        f"📊  حالة الفرق",
-        f"📅  {today}  ⏰  {t}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        "",
-        "     الفريق          صبح    عصر",
-        "─────────────────────────────",
-    ]
+    today = now_egypt().strftime("%d/%m")
+    t = now_egypt().strftime("%I:%M%p")
 
     m_done = 0
     a_done = 0
+    done_list = []
+    partial_list = []
+    missing_list = []
+
     for gid, name in TEAMS.items():
         leader = get_leader(name)
         m = morning_photos.get(gid, 0)
         a = afternoon_photos.get(gid, 0)
-
-        m_icon = "✅" if m >= MORNING_REQUIRED else f"{'🟡' if m > 0 else '❌'}{m}/{MORNING_REQUIRED}"
-        a_icon = "✅" if a >= AFTERNOON_REQUIRED else f"{'🟡' if a > 0 else '❌'}{a}/{AFTERNOON_REQUIRED}"
         paused = " ⏸" if gid in paused_teams else ""
 
         if m >= MORNING_REQUIRED:
@@ -466,15 +458,29 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if a >= AFTERNOON_REQUIRED:
             a_done += 1
 
-        lines.append(f"  {name:<12} {m_icon:<6}  {a_icon}{paused}")
+        if m >= MORNING_REQUIRED and a >= AFTERNOON_REQUIRED:
+            done_list.append(f"  ✅ {name}{paused}")
+        elif m > 0 or a > 0:
+            partial_list.append(f"  🟡 {name} - صبح {m}/{MORNING_REQUIRED} عصر {a}/{AFTERNOON_REQUIRED}{paused}")
+        else:
+            missing_list.append(f"  ❌ {name}{paused}")
 
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📈 الصبح: {m_done}/{len(TEAMS)}  |  العصر: {a_done}/{len(TEAMS)}")
+    lines = [f"📊 حالة الفرق  {today} {t}\n"]
 
-    if m_done == len(TEAMS) and a_done == len(TEAMS):
-        lines.append("\n🎉 كل الفرق خلصت التقارير!")
-    elif m_done == 0 and a_done == 0:
-        lines.append("\n⏳ لسه مفيش حد بعت")
+    if done_list:
+        lines.append("مكتمل:")
+        lines.extend(done_list)
+        lines.append("")
+    if partial_list:
+        lines.append("ناقص:")
+        lines.extend(partial_list)
+        lines.append("")
+    if missing_list:
+        lines.append("لم يبدأ:")
+        lines.extend(missing_list)
+        lines.append("")
+
+    lines.append(f"الصبح {m_done}/{len(TEAMS)} | العصر {a_done}/{len(TEAMS)}")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -593,33 +599,67 @@ async def compare_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════
 # /alert, /broadcast, /team, /pause (same as before)
 # ══════════════════════════════════════════════════════════════════════
+def alert_teams_keyboard(selected: set) -> InlineKeyboardMarkup:
+    """Build multi-select keyboard for /alert."""
+    buttons = []
+    buttons.append([InlineKeyboardButton("📢 كل الفرق", callback_data="alert_all")])
+    for gid, name in TEAMS.items():
+        check = "✅" if gid in selected else "⬜"
+        buttons.append([InlineKeyboardButton(f"{check} {name}", callback_data=f"alert_toggle_{gid}")])
+    if selected:
+        buttons.append([InlineKeyboardButton(f"➡️ متابعة ({len(selected)} فريق)", callback_data="alert_done")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def alert_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return ConversationHandler.END
-    await update.message.reply_text("اختار الفريق أو كل الفرق:", reply_markup=teams_keyboard(include_all=True))
+    context.user_data["alert_selected"] = set()
+    await update.message.reply_text(
+        "اختار الفرق (اضغط على أكتر من فريق):",
+        reply_markup=alert_teams_keyboard(set()),
+    )
     return ALERT_PICK_TEAM
 
 
 async def alert_pick_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    picked = query.data.replace("team_", "")
-    if picked == "all":
-        context.user_data["alert_gid"] = "all"
-        await query.edit_message_text("📢 كل الفرق\n\n✏️ اكتب الرسالة:")
-    else:
-        gid = int(picked)
-        context.user_data["alert_gid"] = gid
-        await query.edit_message_text(f"فريق: {team_name(gid)}\n\n✏️ اكتب الرسالة:")
-    return ALERT_TYPE_MSG
+    data = query.data
+
+    if data == "alert_all":
+        context.user_data["alert_selected"] = set(TEAMS.keys())
+        names = "كل الفرق"
+        await query.edit_message_text(f"📢 {names}\n\n✏️ اكتب الرسالة:")
+        return ALERT_TYPE_MSG
+
+    if data == "alert_done":
+        selected = context.user_data.get("alert_selected", set())
+        if not selected:
+            await query.answer("اختار فريق واحد على الأقل")
+            return ALERT_PICK_TEAM
+        names = ", ".join(team_name(g) for g in selected)
+        await query.edit_message_text(f"📤 الفرق: {names}\n\n✏️ اكتب الرسالة:")
+        return ALERT_TYPE_MSG
+
+    if data.startswith("alert_toggle_"):
+        gid = int(data.replace("alert_toggle_", ""))
+        selected = context.user_data.get("alert_selected", set())
+        if gid in selected:
+            selected.discard(gid)
+        else:
+            selected.add(gid)
+        context.user_data["alert_selected"] = selected
+        await query.edit_message_reply_markup(reply_markup=alert_teams_keyboard(selected))
+        return ALERT_PICK_TEAM
 
 
 async def alert_type_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["alert_msg"] = update.message.text
-    target = context.user_data["alert_gid"]
-    label = f"كل الفرق ({len(TEAMS)})" if target == "all" else team_name(target)
+    selected = context.user_data.get("alert_selected", set())
+    names = ", ".join(team_name(g) for g in selected)
     await update.message.reply_text(
-        f"📤 إرسال لـ {label}:\n\n{update.message.text}\n\nتأكيد؟",
+        f"📤 إرسال لـ {len(selected)} فريق:\n{names}\n\n{update.message.text}\n\nتأكيد؟",
         reply_markup=confirm_keyboard(),
     )
     return ALERT_CONFIRM
@@ -629,14 +669,13 @@ async def alert_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "confirm_yes":
-        target = context.user_data["alert_gid"]
+        selected = context.user_data.get("alert_selected", set())
         msg = context.user_data["alert_msg"]
-        if target == "all":
-            await send_to_all(context, msg)
-            await query.edit_message_text(f"✅ تم الإرسال لكل الفرق")
-        else:
-            await send_to_group(context, target, msg)
-            await query.edit_message_text(f"✅ تم الإرسال لـ {team_name(target)}")
+        sent = 0
+        for gid in selected:
+            await send_to_group(context, gid, msg)
+            sent += 1
+        await query.edit_message_text(f"✅ تم الإرسال لـ {sent} فريق")
     else:
         await query.edit_message_text("❌ تم الإلغاء")
     context.user_data.clear()
@@ -887,7 +926,7 @@ def main():
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("alert", alert_start)],
         states={
-            ALERT_PICK_TEAM: [CallbackQueryHandler(alert_pick_team, pattern=r"^team_")],
+            ALERT_PICK_TEAM: [CallbackQueryHandler(alert_pick_team, pattern=r"^alert_")],
             ALERT_TYPE_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, alert_type_msg)],
             ALERT_CONFIRM: [CallbackQueryHandler(alert_confirm, pattern=r"^confirm_")],
         },
