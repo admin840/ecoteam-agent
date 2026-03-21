@@ -1000,21 +1000,54 @@ async def smart_analysis(
     ctx = await build_team_context(team_name, all_data)
     context_text = format_context_for_prompt(ctx)
 
-    # Verify screenshot vs sheet - use team's own sheet first, then master
-    verify_source = None
-    if ctx.get("team_sheet_today"):
-        # Convert team sheet format to master sheet format for comparison
-        ts = ctx["team_sheet_today"]
-        verify_source = {
-            "Spend اليوم": ts.get("Spend", ""),
-            "Orders اليوم": ts.get("New Orders", ""),
-            "CPO اليوم": ts.get("CPO", ""),
-        }
-    elif ctx.get("today"):
-        verify_source = ctx["today"]
+    # ── Team sheet data (PRIMARY source for comparison) ──
+    team_sheet = ctx.get("team_sheet_today")
+    team_sheet_recent = get_team_sheet_recent(ctx.get("team_sheet_rows", []), 5)
 
-    verification = verify_screenshot_vs_sheet(screenshot_data, verify_source)
-    verification_text = verification["summary"]
+    # Build team sheet section for prompt
+    ts_text = ""
+    if team_sheet:
+        ts_text = f"\n## بيانات شيت الفريق (آخر يوم مسجّل):\n"
+        ts_text += f"  التاريخ: {team_sheet.get('Date', '?')}\n"
+        ts_text += f"  Spend: {team_sheet.get('Spend', '-')}\n"
+        ts_text += f"  طلبات جديدة: {team_sheet.get('New Orders', '-')}\n"
+        ts_text += f"  طلبات أمس: {team_sheet.get('Yesterday New', '-')}\n"
+        ts_text += f"  Delivered: {team_sheet.get('Delivered', '-')}\n"
+        ts_text += f"  Cancel: {team_sheet.get('Cancel', '-')}\n"
+        ts_text += f"  Hold: {team_sheet.get('Hold', '-')}\n"
+        ts_text += f"  CPO: {team_sheet.get('CPO', '-')}\n"
+        ts_text += f"  🚦: {team_sheet.get('Lamp', '-')}\n"
+        ts_text += f"  Del%: {team_sheet.get('Del%', '-')} | Cancel%: {team_sheet.get('Cancel%', '-')} | Hold%: {team_sheet.get('Hold%', '-')}\n"
+
+    if team_sheet_recent and len(team_sheet_recent) > 1:
+        ts_text += f"\n## آخر {len(team_sheet_recent)} أيام من شيت الفريق:\n"
+        for r in team_sheet_recent:
+            ts_text += f"  {r.get('Date','?')}: Spend={r.get('Spend','-')} | Orders={r.get('New Orders','-')} | CPO={r.get('CPO','-')} | {r.get('Lamp','')}\n"
+
+    # Check if screenshot numbers look like MTD totals (much bigger than daily)
+    ss_spend = _safe_num(screenshot_data.get("spend"))
+    ts_spend = _safe_num(team_sheet.get("Spend", "")) if team_sheet else None
+    is_mtd = False
+    if ss_spend and ts_spend and ts_spend > 0 and ss_spend > ts_spend * 5:
+        # Screenshot spend is 5x+ bigger than daily = probably MTD totals
+        is_mtd = True
+        logger.info("Screenshot looks like MTD totals (ss=%s vs daily=%s)", ss_spend, ts_spend)
+
+    # Verify screenshot vs team sheet (skip if MTD)
+    if is_mtd:
+        verification = {"status": "mtd_totals", "discrepancies": [], "summary": "📊 الأرقام دي MTD (تراكمي الشهر) مش أرقام اليوم"}
+    else:
+        verify_source = None
+        if team_sheet:
+            verify_source = {
+                "Spend اليوم": team_sheet.get("Spend", ""),
+                "Orders اليوم": team_sheet.get("New Orders", ""),
+                "CPO اليوم": team_sheet.get("CPO", ""),
+            }
+        elif ctx.get("today"):
+            verify_source = ctx["today"]
+
+        verification = verify_screenshot_vs_sheet(screenshot_data, verify_source)
 
     # Screenshot data section
     ss_parts = ["## بيانات الـ Screenshot:"]
@@ -1024,51 +1057,81 @@ async def smart_analysis(
         ss_parts.append(f"  {k}: {v}")
     ss_text = "\n".join(ss_parts)
 
-    # Build the analysis prompt based on verification status
+    # ── Build the analysis prompt ──
     if verification["status"] == "major_diff":
-        # Priority: fix discrepancies first
-        analysis_prompt = f"""{context_text}
+        analysis_prompt = f"""## فريق: {team_name} | التيم ليدر: {leader}
 
 {ss_text}
+{ts_text}
 
-## 🔴 نتيجة المقارنة:
-{verification_text}
-
-تفاصيل الفروقات:
-{json.dumps(verification['discrepancies'], ensure_ascii=False, indent=2)}
-
-## المطلوب (أولوية قصوى - الأرقام مش متطابقة):
-1. وضّح لـ {leader} إن في فرق بين أرقام الـ screenshot والشيت
-2. حدد بالظبط أنهي رقم مختلف وقد إيه الفرق
-3. اطلب منه يراجع ويصلح الشيت أو يفسّر سبب الفرق
-4. لو الفرق في الـ Spend: اسأل هل في campaign اتوقفت أو budget اتغير
-5. لو الفرق في الـ Orders: اسأل هل في طلبات ناقصة أو مكررة
-
-قواعد: خاطب {leader} بالاسم. مختصر (4-6 سطور). بالعربي المصري."""
-
-    else:
-        # Normal analysis with full intelligence
-        analysis_prompt = f"""{context_text}
-
-{ss_text}
-
-## نتيجة المقارنة: {verification_text}
+## 🔴 فرق في الأرقام:
+{verification['summary']}
 
 ## المطلوب:
-حلل الـ screenshot ده بناءً على اللي شايفه في الصورة + بيانات الشيت:
+{leader} كاتب في الشيت أرقام مختلفة عن اللي في الـ screenshot:
+- وضّح بالظبط أنهي رقم مختلف (الشيت بيقول X والـ screenshot بيقول Y)
+- اسأله: "أنهي الرقم الصح؟ الشيت ولا الـ screenshot؟"
+- لو الفرق كبير اطلب يبعت screenshot تاني أو يعدّل الشيت
 
-1. اقرأ الأرقام من الصورة وقارنها مع الشيت لو متاح
-2. لو الأرقام كويسة: امدح باختصار
-3. لو في حاجة محتاجة تتحسن: قول نصيحة عملية واحدة
-4. لو محتاج معلومات إضافية (breakdown، creative): اطلبها
+قواعد: خاطب {leader} بالاسم. مختصر (3-5 سطور). بالعربي المصري. متزعلوش."""
 
-## قواعد مهمة جداً:
+    elif verification["status"] == "mtd_totals":
+        analysis_prompt = f"""## فريق: {team_name} | التيم ليدر: {leader}
+
+{ss_text}
+{ts_text}
+
+## ملاحظة: الأرقام في الـ screenshot دي تراكمية (MTD) مش أرقام يوم واحد.
+الـ screenshot بيقول: Spend={screenshot_data.get('spend','-')} | Orders={screenshot_data.get('orders') or screenshot_data.get('results','-')}
+شيت الفريق آخر يوم: Spend={team_sheet.get('Spend','-') if team_sheet else '?'} | Orders={team_sheet.get('New Orders','-') if team_sheet else '?'}
+
+## المطلوب:
+- وضّح إن الأرقام دي تراكمي الشهر مش أرقام اليوم
+- احسب الـ CPO التراكمي وقيّمه
+- قارن مع أرقام آخر يوم في الشيت
+- لو الأداء كويس: امدح. لو محتاج يتحسن: نصيحة واحدة
+
+خاطب {leader} بالاسم. مختصر (3-4 سطور). بالعربي المصري."""
+
+    elif verification["status"] == "sheet_not_updated":
+        analysis_prompt = f"""## فريق: {team_name} | التيم ليدر: {leader}
+
+{ss_text}
+{ts_text}
+
+## المطلوب:
+الشيت لسه مش متحدث لليوم ده. حلل الأرقام اللي في الـ screenshot بس:
+- لو فيها spend و orders: احسب الـ CPO وقيّمه
+- قول ملاحظة مفيدة واحدة بس
+- لو الأرقام كويسة: امدح باختصار
+
+قواعد: خاطب {leader} بالاسم. مختصر (2-3 سطور). بالعربي المصري."""
+
+    else:
+        analysis_prompt = f"""## فريق: {team_name} | التيم ليدر: {leader}
+
+{ss_text}
+{ts_text}
+{context_text}
+
+## نتيجة المقارنة: {verification['summary']}
+
+## المطلوب:
+حلل بناءً على الصورة + شيت الفريق:
+1. لو الأرقام متطابقة: قيّم الأداء (CPO كويس؟ trend بيتحسن؟)
+2. لو فيه حاجة محتاجة تتحسن: نصيحة عملية واحدة
+3. لو كل حاجة تمام: امدح باختصار
+
+## فهم الأرقام:
+- CPO = Spend ÷ New Orders (سعر الطلب قبل التسليم)
+- CPA = Spend أمس ÷ Delivered النهاردة (السعر الحقيقي) - الأهم
+- CPO 🟢 ≤ 150 | 🟡 ≤ 180 | 🔴 > 180
+- Cancel% 🔴 ≥ 30%
+
+قواعد:
 - خاطب {leader} بالاسم
-- رد مختصر (3-5 سطور ماكس)
-- متفترضش مشاكل مش واضحة من الصورة - حلل بس اللي قدامك
-- لو الشيت فاضي أو مفيش بيانات: متقولش "في مشكلة" - ممكن لسه محدش حدّث الشيت
-- لو كل حاجة عادية: سطرين بس وخلاص
-- متسألش أكتر من سؤال واحد
+- مختصر (3-5 سطور)
+- حلل بس اللي قدامك - متفترضش مشاكل
 - بالعربي المصري"""
 
     try:
