@@ -42,7 +42,7 @@ TEAMS: dict[int, str] = {
 
 # ── Report requirements ──────────────────────────────────────────────
 MORNING_REQUIRED = 3   # sheets, budget, dashboard
-AFTERNOON_REQUIRED = 2  # ad account, budget
+AFTERNOON_REQUIRED = 3  # ad account, budget, orders count
 
 # ── State tracking ───────────────────────────────────────────────────
 # morning_photos:   {group_id: count}
@@ -135,9 +135,10 @@ MORNING_MSG = (
 
 AFTERNOON_MSG = (
     "مساء الخير! 🌇\n\n"
-    "📋 مطلوب تقرير الساعة 4 - 2 screenshots:\n"
+    "📋 مطلوب تقرير الساعة 4 - 3 screenshots:\n"
     "1️⃣ الحساب الإعلاني (Facebook/TikTok)\n"
-    "2️⃣ البادجيت المصروف لحد دلوقتي\n\n"
+    "2️⃣ البادجيت المصروف لحد دلوقتي\n"
+    "3️⃣ عدد الطلبات لحد الساعة 4 من الفيسبوك أو التيك توك\n\n"
     "شكراً 🙏"
 )
 
