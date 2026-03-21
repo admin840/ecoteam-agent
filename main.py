@@ -38,16 +38,16 @@ def now_egypt() -> datetime:
 # ── Teams ────────────────────────────────────────────────────────────
 TEAMS: dict[int, str] = {
     -4757552003: "Kuwaitmall",
-    -2683433256: "Meeven",
-    -4805699706: "Blinken",
+    -1002683433256: "Meeven",
+    -1003841167962: "Blinken",
     -4669249424: "Matajer",
-    -3637090384: "Bazar",
+    -1003637090384: "Bazar",
     -4860903521: "Minimarket",
-    -3714646416: "Khosomaat",
+    -1003714646416: "Khosomaat",
     -4704859302: "Trend",
-    -2691026546: "Aswaq",
-    -2658420756: "Flash",
-    -2546787010: "Deelat",
+    -1002691026546: "Aswaq",
+    -1002658420756: "Flash",
+    -1002546787010: "Deelat",
 }
 
 # ── Report requirements ──────────────────────────────────────────────
@@ -108,9 +108,9 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def send_to_group(context: ContextTypes.DEFAULT_TYPE, gid: int, text: str):
+async def send_to_group(context: ContextTypes.DEFAULT_TYPE, gid: int, text: str, parse_mode: str = None):
     try:
-        await context.bot.send_message(chat_id=gid, text=text)
+        await context.bot.send_message(chat_id=gid, text=text, parse_mode=parse_mode)
     except Exception as e:
         logger.error("Send to %s failed: %s", team_name(gid), e)
 
@@ -247,43 +247,87 @@ async def auto_afternoon_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 async def daily_noon_report(context: ContextTypes.DEFAULT_TYPE):
     """12:00 PM Egypt - Send daily summary to owner."""
-    from analyzer import fetch_master_data, get_team_today_data, get_sheet_name, get_leader
+    from analyzer import fetch_master_data, get_team_today_data, get_leader
 
-    today = now_egypt().strftime("%Y-%m-%d")
-    lines = [f"📊 ملخص يومي - {today}\n"]
+    today = now_egypt().strftime("%d/%m/%Y")
+    t = now_egypt().strftime("%I:%M %p")
 
-    # Fetch real data from Master Sheet
     all_data = await fetch_master_data()
 
-    lines.append("═══ تقرير الصبح ═══")
+    lines = [
+        "╔══════════════════════════════╗",
+        "║     📊  الملخص اليومي        ║",
+        f"║  📅 {today}   ⏰ {t}   ║",
+        "╚══════════════════════════════╝",
+        "",
+    ]
+
+    # ── Morning Report ──
+    lines.append("┌─── 🌅 تقرير الصبح ───┐")
+    lines.append("")
+    m_done = 0
     for gid, name in TEAMS.items():
-        count = morning_photos.get(gid, 0)
         leader = get_leader(name)
-        m_status = "✅" if count >= MORNING_REQUIRED else f"❌ ({count}/{MORNING_REQUIRED})"
+        count = morning_photos.get(gid, 0)
         paused = " ⏸" if gid in paused_teams else ""
 
-        # Add sheet data
+        if count >= MORNING_REQUIRED:
+            icon = "✅"
+            m_done += 1
+        elif count > 0:
+            icon = f"🟡 {count}/{MORNING_REQUIRED}"
+        else:
+            icon = f"❌ 0/{MORNING_REQUIRED}"
+
+        # Sheet data
         sheet_data = get_team_today_data(all_data, name)
-        sheet_info = ""
+        sheet_line = ""
         if sheet_data:
             spend = sheet_data.get("Spend اليوم", 0)
             orders = sheet_data.get("Orders اليوم", 0)
             cpo = sheet_data.get("CPO اليوم", "-")
-            action = sheet_data.get("🚦 اليوم", "")
-            sheet_info = f" | S:{spend} O:{orders} CPO:{cpo} {action}"
+            action = sheet_data.get("\U0001f6a6 اليوم", "")
+            if spend or orders:
+                sheet_line = f"\n     💰{spend:,} | 📦{orders} | CPO:{cpo} {action}"
 
-        lines.append(f"  {name} ({leader}): {m_status}{paused}{sheet_info}")
+        lines.append(f"  {icon} {name} ({leader}){paused}{sheet_line}")
 
-    lines.append("\n═══ تقرير الساعة 4 ═══")
+    lines.append("")
+
+    # ── Afternoon Report ──
+    lines.append("┌─── 🌇 تقرير العصر ───┐")
+    lines.append("")
+    a_done = 0
     for gid, name in TEAMS.items():
+        leader = get_leader(name)
         count = afternoon_photos.get(gid, 0)
-        a_status = "✅" if count >= AFTERNOON_REQUIRED else f"❌ ({count}/{AFTERNOON_REQUIRED})"
         paused = " ⏸" if gid in paused_teams else ""
-        lines.append(f"  {name}: {a_status}{paused}")
 
-    m_done = sum(1 for g in TEAMS if morning_photos.get(g, 0) >= MORNING_REQUIRED)
-    a_done = sum(1 for g in TEAMS if afternoon_photos.get(g, 0) >= AFTERNOON_REQUIRED)
-    lines.append(f"\n📈 الصبح: {m_done}/{len(TEAMS)} | العصر: {a_done}/{len(TEAMS)}")
+        if count >= AFTERNOON_REQUIRED:
+            icon = "✅"
+            a_done += 1
+        elif count > 0:
+            icon = f"🟡 {count}/{AFTERNOON_REQUIRED}"
+        else:
+            icon = f"❌ 0/{AFTERNOON_REQUIRED}"
+
+        lines.append(f"  {icon} {name} ({leader}){paused}")
+
+    lines.append("")
+    lines.append("┌─── 📈 الإجمالي ───┐")
+    lines.append(f"  الصبح: {m_done}/{len(TEAMS)}  |  العصر: {a_done}/{len(TEAMS)}")
+
+    # Warnings
+    missing_morning = [team_name(g) for g in TEAMS if morning_photos.get(g, 0) < MORNING_REQUIRED and g not in paused_teams]
+    missing_afternoon = [team_name(g) for g in TEAMS if afternoon_photos.get(g, 0) < AFTERNOON_REQUIRED and g not in paused_teams]
+
+    if missing_morning or missing_afternoon:
+        lines.append("")
+        lines.append("┌─── ⚠️ تحذيرات ───┐")
+        if missing_morning:
+            lines.append(f"  صبح ناقص: {', '.join(missing_morning)}")
+        if missing_afternoon:
+            lines.append(f"  عصر ناقص: {', '.join(missing_afternoon)}")
 
     await notify_owner(context, "\n".join(lines))
 
@@ -393,21 +437,45 @@ async def afternoon_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    today = now_egypt().strftime("%Y-%m-%d")
-    lines = [f"📊 حالة الفرق - {today}\n"]
+    from analyzer import get_leader
+    today = now_egypt().strftime("%d/%m/%Y")
+    t = now_egypt().strftime("%I:%M %p")
+
+    lines = [
+        f"📊  حالة الفرق",
+        f"📅  {today}  ⏰  {t}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "     الفريق          صبح    عصر",
+        "─────────────────────────────",
+    ]
+
+    m_done = 0
+    a_done = 0
     for gid, name in TEAMS.items():
-        from analyzer import get_leader
         leader = get_leader(name)
         m = morning_photos.get(gid, 0)
         a = afternoon_photos.get(gid, 0)
-        m_icon = "✅" if m >= MORNING_REQUIRED else f"⏳{m}/{MORNING_REQUIRED}"
-        a_icon = "✅" if a >= AFTERNOON_REQUIRED else f"⏳{a}/{AFTERNOON_REQUIRED}"
-        paused = " ⏸" if gid in paused_teams else ""
-        lines.append(f"{name} ({leader}): صبح {m_icon} | عصر {a_icon}{paused}")
 
-    m_done = sum(1 for g in TEAMS if morning_photos.get(g, 0) >= MORNING_REQUIRED)
-    a_done = sum(1 for g in TEAMS if afternoon_photos.get(g, 0) >= AFTERNOON_REQUIRED)
-    lines.append(f"\n📈 الصبح: {m_done}/{len(TEAMS)} | العصر: {a_done}/{len(TEAMS)}")
+        m_icon = "✅" if m >= MORNING_REQUIRED else f"{'🟡' if m > 0 else '❌'}{m}/{MORNING_REQUIRED}"
+        a_icon = "✅" if a >= AFTERNOON_REQUIRED else f"{'🟡' if a > 0 else '❌'}{a}/{AFTERNOON_REQUIRED}"
+        paused = " ⏸" if gid in paused_teams else ""
+
+        if m >= MORNING_REQUIRED:
+            m_done += 1
+        if a >= AFTERNOON_REQUIRED:
+            a_done += 1
+
+        lines.append(f"  {name:<12} {m_icon:<6}  {a_icon}{paused}")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📈 الصبح: {m_done}/{len(TEAMS)}  |  العصر: {a_done}/{len(TEAMS)}")
+
+    if m_done == len(TEAMS) and a_done == len(TEAMS):
+        lines.append("\n🎉 كل الفرق خلصت التقارير!")
+    elif m_done == 0 and a_done == 0:
+        lines.append("\n⏳ لسه مفيش حد بعت")
+
     await update.message.reply_text("\n".join(lines))
 
 
@@ -457,52 +525,63 @@ async def compare_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    # Build detailed comparison
-    lines = [f"📊 مقارنة تفصيلية - {name} ({leader})\n"]
-    lines.append(f"📅 التاريخ: {today_data.get('التاريخ', '?')}")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━")
-
-    # Today's data
     spend = today_data.get("Spend اليوم", 0)
     orders = today_data.get("Orders اليوم", 0)
     cpo = today_data.get("CPO اليوم", "-")
-    action_today = today_data.get("🚦 اليوم", "")
+    action_today = today_data.get("\U0001f6a6 اليوم", "")
     spend_y = today_data.get("Spend أمس", "-")
     delivered = today_data.get("Delivered", 0)
     cancel = today_data.get("Cancel", 0)
     hold = today_data.get("Hold", 0)
     cancel_pct = today_data.get("Cancel%", "0%")
     cpa = today_data.get("CPA الحقيقي", "-")
-    action_yest = today_data.get("🚦 أمس", "")
+    action_yest = today_data.get("\U0001f6a6 أمس", "")
 
-    lines.append(f"\n📈 اليوم:")
-    lines.append(f"  Spend: {spend:,} جنيه")
-    lines.append(f"  Orders: {orders}")
-    lines.append(f"  CPO: {cpo} {action_today}")
+    m = morning_photos.get(gid, 0)
+    a = afternoon_photos.get(gid, 0)
 
-    lines.append(f"\n📉 أمس (التسليم):")
-    lines.append(f"  Spend أمس: {spend_y}")
-    lines.append(f"  Delivered: {delivered}")
-    lines.append(f"  Cancel: {cancel} ({cancel_pct})")
-    lines.append(f"  Hold: {hold}")
-    lines.append(f"  CPA الحقيقي: {cpa} {action_yest}")
+    lines = [
+        f"╔══════════════════════════════╗",
+        f"║  📊 {name} ({leader})",
+        f"║  📅 {today_data.get('التاريخ', '?')}",
+        f"╚══════════════════════════════╝",
+        "",
+        "┌─── 📈 بيانات اليوم ───┐",
+        f"│  💰 Spend:    {spend:>8,} جنيه",
+        f"│  📦 Orders:   {orders:>8}",
+        f"│  🏷️ CPO:      {cpo:>8}",
+        f"│  🚦 القرار:   {action_today}",
+        "└──────────────────────────┘",
+        "",
+        "┌─── 📉 بيانات أمس ───┐",
+        f"│  💰 Spend أمس: {spend_y:>7}",
+        f"│  ✅ Delivered:  {delivered:>7}",
+        f"│  ❌ Cancel:     {cancel:>7} ({cancel_pct})",
+        f"│  ⏳ Hold:       {hold:>7}",
+        f"│  🏷️ CPA:       {cpa:>7}",
+        f"│  🚦 القرار:    {action_yest}",
+        "└──────────────────────────┘",
+    ]
 
-    # Trend analysis
+    # Trend
     if len(history) >= 2:
-        lines.append(f"\n📊 Trend (آخر {len(history)} أيام):")
-        for row in history:
+        lines.append("")
+        lines.append("┌─── 📊 آخر 5 أيام ───┐")
+        for row in history[-5:]:
             d = row.get("التاريخ", "?")
             s = row.get("Spend اليوم", 0)
             o = row.get("Orders اليوم", 0)
             c = row.get("CPO اليوم", "-")
-            a = row.get("🚦 اليوم", "")
-            lines.append(f"  {d}: S:{s} O:{o} CPO:{c} {a}")
+            act = row.get("\U0001f6a6 اليوم", "")
+            s_fmt = f"{s:,}" if isinstance(s, (int, float)) and s > 0 else "-"
+            lines.append(f"│ {d} │ 💰{s_fmt:>7} │ 📦{o:>3} │ CPO:{c:>4} {act}")
+        lines.append("└──────────────────────────┘")
 
-    # Screenshots status
-    m = morning_photos.get(gid, 0)
-    a = afternoon_photos.get(gid, 0)
-    lines.append(f"\n📸 Screenshots:")
-    lines.append(f"  صبح: {m}/{MORNING_REQUIRED} | عصر: {a}/{AFTERNOON_REQUIRED}")
+    # Screenshots
+    lines.append("")
+    m_icon = "✅" if m >= MORNING_REQUIRED else f"{'🟡' if m > 0 else '❌'} {m}/{MORNING_REQUIRED}"
+    a_icon = "✅" if a >= AFTERNOON_REQUIRED else f"{'🟡' if a > 0 else '❌'} {a}/{AFTERNOON_REQUIRED}"
+    lines.append(f"📸 صبح: {m_icon}  |  عصر: {a_icon}")
 
     await context.bot.send_message(
         chat_id=query.message.chat_id,
