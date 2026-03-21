@@ -92,19 +92,33 @@ import csv
 import io as _io
 
 def _current_sheet_tab() -> str:
-    """Get current month's tab name: 'التقرير اليومي (March-2026)'"""
+    """Get current month's tab name: 'March-2026' (cycle runs 26th to 25th)."""
     now = datetime.now()
-    return f"التقرير اليومي ({now.strftime('%B-%Y')})"
+    # Month cycle: 26th to 25th. If we're before 26th, use current month name.
+    # If 26th or later, use next month name.
+    if now.day >= 26:
+        # Next month's cycle has started
+        if now.month == 12:
+            return f"January-{now.year + 1}"
+        month_names = ["", "January", "February", "March", "April", "May", "June",
+                       "July", "August", "September", "October", "November", "December"]
+        return f"{month_names[now.month + 1]}-{now.year}"
+    return f"{now.strftime('%B')}-{now.year}"
+
+
+# Standard column names for team sheets (same across all teams)
+TEAM_SHEET_COLUMNS = [
+    "Date", "Spend", "New Orders", "Yesterday New",
+    "Delivered", "Cancel", "Hold", "CPO",
+    "Daily Target", "Gap", "Lamp", "Del%", "Cancel%", "Hold%",
+]
 
 
 async def fetch_team_sheet(team_name: str) -> list[dict]:
     """
     Read data directly from a team's individual Google Sheet.
-    Uses the Google Sheets CSV export (no API key needed if sheet is shared).
-    Returns list of row dicts with the team's daily data.
-
-    Columns: Date, Spend, New Orders, Yesterday New, Delivered, Cancel, Hold,
-             CPO, Daily Target, Gap, Lamp, Del%, Cancel%, Hold%
+    The sheet has a summary section at top, then daily data below.
+    We find the "Date" header row and parse from there.
     """
     info = TEAM_INFO.get(team_name)
     if not info or not info.get("sheet_id"):
@@ -113,7 +127,6 @@ async def fetch_team_sheet(team_name: str) -> list[dict]:
     sheet_id = info["sheet_id"]
     tab_name = _current_sheet_tab()
 
-    # Google Sheets CSV export URL
     import urllib.parse
     encoded_tab = urllib.parse.quote(tab_name)
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_tab}"
@@ -127,21 +140,64 @@ async def fetch_team_sheet(team_name: str) -> list[dict]:
 
             text = resp.text
             if not text or "<!DOCTYPE" in text[:100]:
-                # Got HTML instead of CSV = sheet not shared/accessible
                 logger.warning("Team sheet not accessible for %s (got HTML)", team_name)
                 return []
 
-            # Parse CSV
-            reader = csv.DictReader(_io.StringIO(text))
-            rows = []
-            for row in reader:
-                # Skip empty rows
-                if not any(v.strip() for v in row.values()):
-                    continue
-                rows.append(dict(row))
+            # Parse CSV - raw rows first
+            reader = csv.reader(_io.StringIO(text))
+            all_rows = list(reader)
 
-            logger.info("Fetched %d rows from %s team sheet", len(rows), team_name)
-            return rows
+            if not all_rows:
+                return []
+
+            # Find the header row (the one that starts with "Date" or contains date-like header)
+            header_idx = None
+            for i, row in enumerate(all_rows):
+                first_cell = row[0].strip() if row else ""
+                if first_cell.lower() == "date" or first_cell == "التاريخ":
+                    header_idx = i
+                    break
+
+            if header_idx is None:
+                # Fallback: use our known column names and find first date row
+                data_rows = []
+                for row in all_rows:
+                    first_cell = row[0].strip() if row else ""
+                    if "/" in first_cell and len(first_cell) <= 12:
+                        # Map to our standard columns
+                        row_dict = {}
+                        for j, col_name in enumerate(TEAM_SHEET_COLUMNS):
+                            if j < len(row):
+                                row_dict[col_name] = row[j].strip()
+                        data_rows.append(row_dict)
+                logger.info("Fetched %d rows from %s (no header, used standard columns)", len(data_rows), team_name)
+                return data_rows
+
+            # Use the real header row
+            headers = [h.strip() for h in all_rows[header_idx]]
+            # Map headers to standard names (first 14 columns)
+            mapped_headers = []
+            for j, h in enumerate(headers):
+                if j < len(TEAM_SHEET_COLUMNS):
+                    mapped_headers.append(TEAM_SHEET_COLUMNS[j])
+                else:
+                    mapped_headers.append(h if h else f"col_{j}")
+
+            # Parse data rows after header
+            data_rows = []
+            for row in all_rows[header_idx + 1:]:
+                first_cell = row[0].strip() if row else ""
+                if not first_cell or "/" not in first_cell:
+                    continue  # Skip non-data rows
+
+                row_dict = {}
+                for j, col_name in enumerate(mapped_headers):
+                    if j < len(row):
+                        row_dict[col_name] = row[j].strip()
+                data_rows.append(row_dict)
+
+            logger.info("Fetched %d daily rows from %s team sheet", len(data_rows), team_name)
+            return data_rows
 
     except Exception as e:
         logger.warning("Team sheet fetch error for %s: %s", team_name, e)
@@ -149,29 +205,20 @@ async def fetch_team_sheet(team_name: str) -> list[dict]:
 
 
 def get_team_sheet_today(rows: list[dict]) -> dict | None:
-    """Get latest data row from team sheet (last row with a date)."""
+    """Get latest row that has actual Spend data (not just a date)."""
     if not rows:
         return None
-    # Find last row that looks like it has a date (contains /)
     for row in reversed(rows):
-        first_val = list(row.values())[0] if row else ""
-        if "/" in str(first_val) and len(str(first_val)) <= 12:
-            # Check if row has some actual data (not just a date)
-            vals = list(row.values())[1:]
-            if any(str(v).strip() and str(v).strip() != "" for v in vals):
-                return row
+        spend = row.get("Spend", "").strip()
+        # Must have a non-zero spend value
+        if spend and spend != "0" and spend != "0.00":
+            return row
     return None
 
 
 def get_team_sheet_recent(rows: list[dict], n: int = 5) -> list[dict]:
-    """Get last N data rows from team sheet."""
-    data_rows = []
-    for row in rows:
-        first_val = list(row.values())[0] if row else ""
-        if "/" in str(first_val) and len(str(first_val)) <= 12:
-            vals = list(row.values())[1:]
-            if any(str(v).strip() for v in vals):
-                data_rows.append(row)
+    """Get last N rows that have actual Spend data."""
+    data_rows = [r for r in rows if r.get("Spend", "").strip() and r.get("Spend", "").strip() != "0"]
     return data_rows[-n:]
 
 
