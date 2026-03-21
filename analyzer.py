@@ -7,7 +7,10 @@ import os
 import json
 import base64
 import logging
+import subprocess
+import tempfile
 from datetime import datetime
+from pathlib import Path
 import httpx
 import anthropic
 
@@ -370,3 +373,157 @@ def generate_quick_summary(screenshot_data: dict) -> str:
         parts.append(f"CPO: {spend/orders:,.0f}")
 
     return " | ".join(parts) if parts else "تم استلام الصورة"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Video Creative Analysis
+# ══════════════════════════════════════════════════════════════════════
+
+def extract_video_frames(video_bytes: bytes, num_frames: int = 4) -> list[bytes]:
+    """
+    Extract key frames from a video using ffmpeg.
+    Returns list of JPEG image bytes.
+    """
+    frames = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        video_path = Path(tmpdir) / "input.mp4"
+        video_path.write_bytes(video_bytes)
+
+        # First, get video duration
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(video_path),
+        ]
+        try:
+            result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15)
+            duration = float(result.stdout.strip())
+        except Exception:
+            duration = 10.0  # Default fallback
+
+        # Calculate timestamps for frames (evenly spaced)
+        if duration <= 0:
+            duration = 10.0
+        timestamps = []
+        for i in range(num_frames):
+            t = (duration / (num_frames + 1)) * (i + 1)
+            timestamps.append(min(t, duration - 0.1))
+
+        # Extract frames at each timestamp
+        for i, ts in enumerate(timestamps):
+            output_path = Path(tmpdir) / f"frame_{i}.jpg"
+            extract_cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(ts),
+                "-i", str(video_path),
+                "-vframes", "1",
+                "-q:v", "2",
+                str(output_path),
+            ]
+            try:
+                subprocess.run(extract_cmd, capture_output=True, timeout=15)
+                if output_path.exists():
+                    frames.append(output_path.read_bytes())
+            except Exception as e:
+                logger.warning("Failed to extract frame %d: %s", i, e)
+
+    return frames
+
+
+async def analyze_video_creative(
+    video_bytes: bytes, team_name: str, thumbnail_bytes: bytes | None = None
+) -> str:
+    """
+    Analyze a video creative by extracting frames and sending to Claude.
+    Returns analysis and coaching feedback.
+    """
+    if not CLAUDE_API_KEY:
+        return ""
+
+    leader = get_leader(team_name)
+
+    # Extract frames from video
+    frames = extract_video_frames(video_bytes, num_frames=4)
+
+    if not frames and thumbnail_bytes:
+        frames = [thumbnail_bytes]
+
+    if not frames:
+        return f"⚠️ مش قادر أحلل الفيديو. {leader}، ابعتي screenshot من الفيديو."
+
+    # Build message content with all frames
+    content = []
+    for i, frame in enumerate(frames):
+        img_b64 = base64.b64encode(frame).decode("utf-8")
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
+        })
+
+    prompt = f"""أنت مدير تسويق خبير بتراجع Creative (إعلان فيديو) لفريق {team_name} (التيم ليدر: {leader}).
+
+الصور دي فريمات مستخرجة من فيديو إعلاني. حللها كالتالي:
+
+1. **المحتوى**: إيه المنتج أو العرض اللي في الإعلان؟
+2. **الـ Hook**: أول 3 ثواني بتلفت الانتباه ولا لا؟
+3. **الـ CTA**: في Call to Action واضح؟
+4. **النص والتصميم**: النص واضح؟ الألوان مناسبة؟ الجودة كويسة؟
+5. **نقاط القوة**: إيه الحاجات الكويسة في الإعلان؟
+6. **نقاط الضعف**: إيه اللي محتاج يتحسن؟
+7. **اقتراحات**: 2-3 اقتراحات محددة لتحسين الأداء
+
+خاطب {leader} بالاسم. رد مختصر وعملي (6-10 سطور). بالعربي المصري."""
+
+    content.append({"type": "text", "text": prompt})
+
+    try:
+        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+        )
+        return message.content[0].text.strip()
+
+    except Exception as e:
+        logger.error("Video analysis error: %s", e)
+        return ""
+
+
+async def analyze_image_creative(image_bytes: bytes, team_name: str) -> str:
+    """Analyze an image creative (banner, post, story)."""
+    if not CLAUDE_API_KEY:
+        return ""
+
+    leader = get_leader(team_name)
+    img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = f"""أنت مدير تسويق خبير بتراجع Creative (إعلان صورة) لفريق {team_name} (التيم ليدر: {leader}).
+
+حلل الإعلان ده:
+1. **المنتج/العرض**: إيه اللي بيتعرض؟
+2. **التصميم**: الجودة، الألوان، الترتيب
+3. **النص**: واضح؟ مقنع؟ في CTA؟
+4. **نقاط القوة و الضعف**
+5. **2-3 اقتراحات للتحسين**
+
+خاطب {leader} بالاسم. رد مختصر (4-6 سطور). بالعربي المصري."""
+
+    try:
+        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        message = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=800,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text", "text": prompt},
+            ]}],
+        )
+        return message.content[0].text.strip()
+
+    except Exception as e:
+        logger.error("Image creative analysis error: %s", e)
+        return ""

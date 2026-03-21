@@ -647,6 +647,50 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("Afternoon report complete for %s", name)
 
 
+# ── Video handler: analyze video creatives ───────────────────────────
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Analyze video creatives sent by team leaders."""
+    gid = update.effective_chat.id
+    if gid not in TEAMS:
+        return
+
+    from analyzer import analyze_video_creative, get_leader
+
+    name = team_name(gid)
+    leader = get_leader(name)
+
+    await update.message.reply_text(f"🎬 جاري تحليل الفيديو... استنى ثواني يا {leader}")
+
+    try:
+        # Download video
+        video = update.message.video or update.message.animation
+        if not video:
+            return
+
+        file = await context.bot.get_file(video.file_id)
+        video_bytes = await file.download_as_bytearray()
+
+        # Get thumbnail if available
+        thumb_bytes = None
+        if video.thumbnail:
+            thumb_file = await context.bot.get_file(video.thumbnail.file_id)
+            thumb_bytes = bytes(await thumb_file.download_as_bytearray())
+
+        # Analyze
+        analysis = await analyze_video_creative(
+            bytes(video_bytes), name, thumb_bytes
+        )
+
+        if analysis:
+            await update.message.reply_text(f"🤖 {analysis}")
+        else:
+            await update.message.reply_text("📸 مش قادر أحلل الفيديو. ابعت screenshot من الإعلان.")
+
+    except Exception as e:
+        logger.error("Error analyzing video from %s: %s", name, e)
+        await update.message.reply_text("⚠️ حصل مشكلة في تحليل الفيديو. جرب تاني.")
+
+
 # ── Text reply handler: AI responds to team leader replies ───────────
 async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """When someone replies to the bot in a group, analyze and respond."""
@@ -785,6 +829,11 @@ def main():
 
     # Photos from groups (screenshots + creatives)
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+    # Videos from groups (video creatives)
+    app.add_handler(MessageHandler(
+        filters.VIDEO | filters.ANIMATION, handle_video
+    ))
 
     # Text replies to bot in groups (AI conversation)
     app.add_handler(MessageHandler(
