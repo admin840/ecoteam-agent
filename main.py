@@ -243,21 +243,83 @@ def schedule_report_followups(context_or_jq, report_type: str):
 # AUTO scheduled jobs (Egypt timezone)
 # ══════════════════════════════════════════════════════════════════════
 async def auto_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Auto-send morning reminder at 11:00 AM Egypt time."""
-    morning_photos.clear()
-    await send_to_all(context, MORNING_MSG)
+    """Auto-send SMART morning reminder at 11:00 AM Egypt time.
+    Checks who already sent, and customizes the message for each team."""
+    from analyzer import get_leader
+
+    sent_count = 0
+    already_done = 0
+    partial = 0
+
+    for gid, name in TEAMS.items():
+        if gid in paused_teams:
+            continue
+
+        leader = get_leader(name)
+        count = morning_photos.get(gid, 0)
+
+        if count >= MORNING_REQUIRED:
+            # Already done - thank them!
+            already_done += 1
+            await send_to_group(context, gid,
+                f"صباح الخير يا {leader}! 🌅\nتقريرك مكتمل ✅ شكراً إنك بعتي بدري 💪")
+        elif count > 0:
+            # Partially done - tell them what's missing
+            partial += 1
+            missing = MORNING_REQUIRED - count
+            await send_to_group(context, gid,
+                f"صباح الخير يا {leader}! 🌅\n"
+                f"بعت {count} من {MORNING_REQUIRED} - ناقصك {missing} screenshots:\n"
+                f"{'2️⃣ البادجيت المصروف (Facebook/TikTok)' if count < 2 else ''}\n"
+                f"{'3️⃣ داشبورد الإعلانات' if count < 3 else ''}\n"
+                f"شكراً 🙏")
+        else:
+            # Nothing sent - full reminder
+            sent_count += 1
+            await send_to_group(context, gid, MORNING_MSG)
+
     schedule_report_followups(context.job_queue, "morning")
-    await notify_owner(context, "✅ تم إرسال تذكير الصبح التلقائي (11:00 AM)")
-    logger.info("Auto morning reminder sent")
+    await notify_owner(context,
+        f"✅ تذكير الصبح (11:00 AM)\n"
+        f"  مكتمل: {already_done} | ناقص: {partial} | لم يبدأ: {sent_count}")
+    logger.info("Smart morning reminder: done=%d partial=%d new=%d", already_done, partial, sent_count)
 
 
 async def auto_afternoon_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Auto-send afternoon reminder at 4:00 PM Egypt time."""
-    afternoon_photos.clear()
-    await send_to_all(context, AFTERNOON_MSG)
+    """Auto-send SMART afternoon reminder at 4:00 PM Egypt time."""
+    from analyzer import get_leader
+
+    sent_count = 0
+    already_done = 0
+    partial = 0
+
+    for gid, name in TEAMS.items():
+        if gid in paused_teams:
+            continue
+
+        leader = get_leader(name)
+        count = afternoon_photos.get(gid, 0)
+
+        if count >= AFTERNOON_REQUIRED:
+            already_done += 1
+            await send_to_group(context, gid,
+                f"مساء الخير يا {leader}! 🌇\nتقرير العصر مكتمل ✅ شكراً 💪")
+        elif count > 0:
+            partial += 1
+            missing = AFTERNOON_REQUIRED - count
+            await send_to_group(context, gid,
+                f"مساء الخير يا {leader}! 🌇\n"
+                f"بعت {count} من {AFTERNOON_REQUIRED} - ناقصك {missing} screenshots\n"
+                f"شكراً 🙏")
+        else:
+            sent_count += 1
+            await send_to_group(context, gid, AFTERNOON_MSG)
+
     schedule_report_followups(context.job_queue, "afternoon")
-    await notify_owner(context, "✅ تم إرسال تذكير العصر التلقائي (4:00 PM)")
-    logger.info("Auto afternoon reminder sent")
+    await notify_owner(context,
+        f"✅ تذكير العصر (4:00 PM)\n"
+        f"  مكتمل: {already_done} | ناقص: {partial} | لم يبدأ: {sent_count}")
+    logger.info("Smart afternoon reminder: done=%d partial=%d new=%d", already_done, partial, sent_count)
 
 
 async def daily_noon_report(context: ContextTypes.DEFAULT_TYPE):
