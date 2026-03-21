@@ -246,18 +246,48 @@ async def followup_reminder(context: ContextTypes.DEFAULT_TYPE):
                 f"الرجاء إرسال الـ screenshots الناقصة."
             )
     elif step == 4:
+        from analyzer import get_leader as _gl, fetch_team_sheet, get_team_sheet_today
         for gid in missing:
             photos = morning_photos if report_type == "morning" else afternoon_photos
             count = photos.get(gid, 0)
             name = team_name(gid)
-            from analyzer import get_leader as _gl
             leader = _gl(name)
-            await send_to_group(context, gid,
-                f"⚠️ يا {leader}، للأسف تم تسجيل خصم يوم بسبب عدم إكمال {type_label}.\n"
-                f"لو عندك سبب أو اعتراض رد على الرسالة دي وهيتم تحويل الشكوى للمدير لإعادة النظر 🙏")
-            await notify_owner(context,
-                f"🚨 {name} ({leader}) - خصم يوم: عدم إكمال {type_label} ({count}/{required})")
-            save_deduction(name, f"عدم إكمال {type_label}")
+
+            # ── VERIFY before deducting: check ALL sources ──
+            # 1. Check if team sheet has today's data
+            sheet_updated = False
+            try:
+                rows = await fetch_team_sheet(name)
+                today_row = get_team_sheet_today(rows) if rows else None
+                if today_row:
+                    sheet_updated = True
+            except Exception:
+                pass
+
+            if sheet_updated and count > 0:
+                # Sheet is updated + some photos sent = just missing screenshots
+                missing_cats = get_missing_categories(gid, report_type)
+                missing_text = " + ".join(missing_cats) if missing_cats else "screenshots"
+                await send_to_group(context, gid,
+                    f"يا {leader}، شيتك متحدث 👍 بس لسه ناقص: {missing_text}\n"
+                    f"ابعتهم عشان التقرير يكتمل 🙏")
+                await notify_owner(context,
+                    f"⚠️ {name} ({leader}) - الشيت متحدث بس screenshots ناقصة: {missing_text}")
+            elif sheet_updated and count == 0:
+                # Sheet is updated but no photos at all
+                await send_to_group(context, gid,
+                    f"يا {leader}، شيتك متحدث 👍 بس محتاج screenshots للتوثيق\n"
+                    f"ابعت الـ 3 screenshots (شيت + بادجيت + داشبورد) 🙏")
+                await notify_owner(context,
+                    f"⚠️ {name} ({leader}) - الشيت متحدث بس مفيش screenshots")
+            else:
+                # Sheet NOT updated AND no/partial photos = deduction
+                await send_to_group(context, gid,
+                    f"⚠️ يا {leader}، للأسف تم تسجيل خصم يوم بسبب عدم إكمال {type_label}.\n"
+                    f"لو عندك سبب أو اعتراض رد على الرسالة دي وهيتم تحويل الشكوى للمدير لإعادة النظر 🙏")
+                await notify_owner(context,
+                    f"🚨 {name} ({leader}) - خصم يوم: عدم إكمال {type_label} (الشيت فاضي + {count} صور)")
+                save_deduction(name, f"عدم إكمال {type_label}")
 
 
 def schedule_report_followups(context_or_jq, report_type: str):
