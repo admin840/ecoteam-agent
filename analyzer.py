@@ -951,8 +951,8 @@ async def classify_image(image_bytes: bytes) -> dict:
 - لو الصورة فيها كلمة "Campaigns" أو "Ad Sets" أو "Results" أو "Impressions" = dashboard"""
 
     try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-        message = client.messages.create(
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        message = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=200,
             messages=[{
@@ -1184,8 +1184,8 @@ async def handle_non_report_image(
         return await analyze_image_creative(image_bytes, team_name)
 
     try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-        message = client.messages.create(
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        message = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=300,
             system=SYSTEM_PROMPT,
@@ -1273,6 +1273,20 @@ async def smart_analysis(
     # Get learnings for this team
     learnings_text = get_learnings_for_prompt(team_name)
 
+    # Cross-day intelligence: creative history
+    creative_text = ""
+    last_creative = get_last_creative(team_name)
+    if last_creative:
+        creative_text = f"\n## آخر Creative اتحلل:\n  تاريخ: {last_creative['date']} | نوع: {last_creative['type']}\n  ملخص: {last_creative['summary'][:150]}\n"
+
+    # Budget tracking
+    budget_text = ""
+    budget_today = get_team_budget_today(team_name)
+    if budget_today["total"] > 0:
+        budget_text = f"\n## بادجيت النهاردة: {budget_today['total']:,.0f} جنيه\n"
+        for btype, amount in budget_today["by_type"].items():
+            budget_text += f"  {btype}: {amount:,.0f}\n"
+
     # Verify screenshot vs team sheet (skip if MTD)
     if is_mtd:
         verification = {"status": "mtd_totals", "discrepancies": [], "summary": "📊 الأرقام دي MTD (تراكمي الشهر) مش أرقام اليوم"}
@@ -1354,6 +1368,8 @@ async def smart_analysis(
 {ts_text}
 {context_text}
 {learnings_text}
+{creative_text}
+{budget_text}
 
 ## نتيجة المقارنة: {verification['summary']}
 
@@ -1370,6 +1386,12 @@ async def smart_analysis(
 - شوف الـ Trend: الأداء بيتحسن ولا بيوحش ولا مستقر؟
 - لو في anomaly (ارتفاع/انخفاض مفاجئ): نبّه عليه
 - لو عندك بيانات كافية: ادي insight واحد مفيد
+- لو في creative history: اربط بين تغيير الـ creative والأداء
+
+### كمحلل Creative:
+- لو الـ CPO > 200: اطلب من التيم ليدر يبعت الـ Creative الحالي عشان تحلله
+- لو في creative history وبعده الأداء اتحسن: امدح التغيير
+- لو في creative history وبعده الأداء وحش: اقترح تغيير
 
 ### قواعد:
 - ابدأ بـ "أنا شايف" مش حقائق مطلقة
@@ -1479,8 +1501,8 @@ async def analyze_text_message(team_name: str, text: str, reply_to_text: str = "
 رد مختصر (1-3 سطور). بالعربي المصري. متبالغش."""
 
     try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-        message = client.messages.create(
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        message = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=300,
             system=SYSTEM_PROMPT,
@@ -1735,8 +1757,8 @@ async def analyze_video_creative(
     content.append({"type": "text", "text": "\n".join(prompt_parts)})
 
     try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-        message = client.messages.create(
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        message = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1200,
             system=SYSTEM_PROMPT,
@@ -1744,6 +1766,7 @@ async def analyze_video_creative(
         )
         response = message.content[0].text.strip()
         remember_exchange(team_name, f"[تحليل فيديو] {response[:200]}")
+        save_creative_record(team_name, "video", response[:200])
         return response
 
     except Exception as e:
@@ -1791,8 +1814,8 @@ async def analyze_image_creative(image_bytes: bytes, team_name: str) -> str:
 خاطب {leader} بالاسم. بالعربي المصري. مختصر."""
 
     try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-        message = client.messages.create(
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        message = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=1000,
             system=SYSTEM_PROMPT,
@@ -1803,8 +1826,276 @@ async def analyze_image_creative(image_bytes: bytes, team_name: str) -> str:
         )
         response = message.content[0].text.strip()
         remember_exchange(team_name, f"[تحليل صورة] {response[:200]}")
+        save_creative_record(team_name, "image", response[:200])
         return response
 
     except Exception as e:
         logger.error("Image creative analysis error: %s", e)
         return ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PROACTIVE MONITORING - bot checks sheets and alerts on its own
+# ══════════════════════════════════════════════════════════════════════
+
+async def proactive_sheet_check() -> list[dict]:
+    """
+    Check ALL team sheets proactively. Returns list of alerts.
+    Called by scheduled job - bot initiates, doesn't wait for screenshots.
+    """
+    alerts = []
+    now = _now_egypt()
+    today_str = now.strftime("%-m/%-d/%Y")  # Match sheet date format
+
+    for team_name, info in TEAM_INFO.items():
+        try:
+            rows = await fetch_team_sheet(team_name)
+            if not rows:
+                alerts.append({
+                    "team": team_name, "leader": info["leader"],
+                    "type": "no_data", "severity": "warn",
+                    "msg": f"مش قادر أقرأ شيت {team_name}"
+                })
+                continue
+
+            today_row = get_team_sheet_today(rows)
+            recent = get_team_sheet_recent(rows, 5)
+
+            # Check if today's data exists
+            if not today_row:
+                alerts.append({
+                    "team": team_name, "leader": info["leader"],
+                    "type": "not_updated", "severity": "info",
+                    "msg": f"{info['leader']} لسه محدثش/محدثتش الشيت النهاردة"
+                })
+                continue
+
+            # Check for anomalies in recent data
+            spend = _safe_num(today_row.get("Spend", ""))
+            orders = _safe_num(today_row.get("New Orders", ""))
+            cpo = _safe_num(today_row.get("CPO", ""))
+            cpa = calculate_cpa_from_sheet(rows)
+
+            # Zero spend alert
+            if spend == 0 and len(recent) > 1:
+                prev_spend = _safe_num(recent[-2].get("Spend", "")) if len(recent) >= 2 else 0
+                if prev_spend and prev_spend > 0:
+                    alerts.append({
+                        "team": team_name, "leader": info["leader"],
+                        "type": "zero_spend", "severity": "critical",
+                        "msg": f"⚠️ {team_name} صرف صفر النهاردة! أمس كان {prev_spend:,.0f}"
+                    })
+
+            # CPO spike (> 200)
+            if cpo and cpo > 200:
+                alerts.append({
+                    "team": team_name, "leader": info["leader"],
+                    "type": "high_cpo", "severity": "warning",
+                    "msg": f"🔴 {team_name} CPO = {cpo:.0f} (عالي جداً)"
+                })
+
+            # CPA spike (> 200)
+            if cpa and cpa > 200:
+                alerts.append({
+                    "team": team_name, "leader": info["leader"],
+                    "type": "high_cpa", "severity": "warning",
+                    "msg": f"🔴 {team_name} CPA = {cpa:.0f} (تكلفة التسليم عالية)"
+                })
+
+            # 3-day declining trend
+            if len(recent) >= 3:
+                cpos = [_safe_num(r.get("CPO", "")) for r in recent[-3:]]
+                cpos = [c for c in cpos if c and c > 0]
+                if len(cpos) == 3 and cpos[0] < cpos[1] < cpos[2]:
+                    alerts.append({
+                        "team": team_name, "leader": info["leader"],
+                        "type": "declining_trend", "severity": "warning",
+                        "msg": f"📉 {team_name} CPO بيعلى 3 أيام ورا بعض: {cpos[0]:.0f} → {cpos[1]:.0f} → {cpos[2]:.0f}"
+                    })
+
+        except Exception as e:
+            logger.error("Proactive check error for %s: %s", team_name, e)
+
+    return alerts
+
+
+async def generate_smart_daily_report() -> str:
+    """
+    Generate a comprehensive daily report with AI analysis.
+    Compares all teams, identifies best/worst, gives strategic recommendations.
+    """
+    if not CLAUDE_API_KEY:
+        return ""
+
+    # Gather all team data
+    all_teams_data = []
+    for team_name, info in TEAM_INFO.items():
+        rows = await fetch_team_sheet(team_name)
+        today = get_team_sheet_today(rows) if rows else None
+        cpa = calculate_cpa_from_sheet(rows) if rows else None
+        recent = get_team_sheet_recent(rows, 5) if rows else []
+
+        if today:
+            all_teams_data.append({
+                "team": team_name,
+                "leader": info["leader"],
+                "spend": _safe_num(today.get("Spend", "")),
+                "orders": _safe_num(today.get("New Orders", "")),
+                "cpo": _safe_num(today.get("CPO", "")),
+                "delivered": _safe_num(today.get("Delivered", "")),
+                "cancel": _safe_num(today.get("Cancel", "")),
+                "cpa": cpa,
+                "date": today.get("Date", ""),
+                "days_data": len(recent),
+            })
+
+    if not all_teams_data:
+        return "مفيش بيانات كافية للتقرير"
+
+    # Build data summary for AI
+    data_text = "## بيانات كل الفرق النهاردة:\n"
+    total_spend = 0
+    total_orders = 0
+    total_delivered = 0
+
+    for t in sorted(all_teams_data, key=lambda x: x.get("cpo") or 999):
+        data_text += f"- {t['team']} ({t['leader']}): Spend={t['spend']:,.0f} | Orders={t['orders']:.0f} | CPO={t['cpo']:.0f if t['cpo'] else '?'} | CPA={t['cpa'] if t['cpa'] else '?'}\n"
+        total_spend += t.get("spend") or 0
+        total_orders += t.get("orders") or 0
+        total_delivered += t.get("delivered") or 0
+
+    data_text += f"\n## الإجمالي:\nSpend: {total_spend:,.0f} | Orders: {total_orders:.0f} | Delivered: {total_delivered:.0f}\n"
+    if total_orders > 0:
+        data_text += f"CPO إجمالي: {total_spend/total_orders:.0f}\n"
+    if total_delivered > 0:
+        data_text += f"CPA إجمالي: {total_spend/total_delivered:.0f}\n"
+
+    prompt = f"""{data_text}
+
+## المطلوب - تقرير يومي ذكي للمالك:
+اكتب تقرير مختصر وعملي (10-15 سطر) يشمل:
+
+1. **ملخص عام**: إجمالي الصرف والطلبات - الأداء كويس ولا محتاج تحسين؟
+2. **أحسن 3 فرق**: مين الأحسن ولية؟
+3. **أسوأ 3 فرق**: مين محتاج مساعدة ولية؟
+4. **توصيات استراتيجية**: (2-3 نصائح عملية)
+   - فريق يستاهل زيادة بادجيت؟
+   - فريق محتاج يوقف ويراجع؟
+   - فريق محتاج يغير creative؟
+5. **سؤال للإدارة**: سؤال واحد مهم للمتابعة
+
+الحملات كلها Facebook Messages Ads. الجمهور مقيمين في الكويت.
+CPO/CPA: أخضر ≤ 150 | أصفر ≤ 180 | أحمر > 180
+بالعربي المصري. مختصر وعملي."""
+
+    try:
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        message = await client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return message.content[0].text.strip()
+    except Exception as e:
+        logger.error("Smart report error: %s", e)
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CREATIVE TRACKING - remember creatives and link to performance
+# ══════════════════════════════════════════════════════════════════════
+
+CREATIVE_HISTORY_FILE = Path("creative_history.json")
+
+
+def load_creative_history() -> list[dict]:
+    if CREATIVE_HISTORY_FILE.exists():
+        try:
+            return json.loads(CREATIVE_HISTORY_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_creative_record(team_name: str, creative_type: str, analysis_summary: str):
+    """Save a record when a creative is analyzed, so we can link it to performance later."""
+    history = load_creative_history()
+    history.append({
+        "date": _now_egypt().strftime("%Y-%m-%d"),
+        "team": team_name,
+        "type": creative_type,  # "video" or "image"
+        "summary": analysis_summary[:300],
+    })
+    # Keep last 50
+    history = history[-50:]
+    CREATIVE_HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_last_creative(team_name: str) -> dict | None:
+    """Get the last creative analyzed for a team."""
+    history = load_creative_history()
+    for record in reversed(history):
+        if record["team"] == team_name:
+            return record
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BUDGET TRACKING - fawry codes + card payments
+# ══════════════════════════════════════════════════════════════════════
+
+BUDGET_FILE = Path("budget_tracking.json")
+
+
+def load_budget_data() -> list[dict]:
+    if BUDGET_FILE.exists():
+        try:
+            return json.loads(BUDGET_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_budget_entry(team_name: str, amount: float, payment_type: str, platform: str, source: str = ""):
+    """
+    Track a budget entry: fawry code, card payment, or prepaid top-up.
+    payment_type: 'fawry' | 'card' | 'prepaid' | 'manual'
+    platform: 'facebook' | 'tiktok'
+    source: 'owner_image' | 'team_payment_screenshot'
+    """
+    data = load_budget_data()
+    data.append({
+        "date": _now_egypt().strftime("%Y-%m-%d"),
+        "team": team_name,
+        "amount": amount,
+        "type": payment_type,
+        "platform": platform,
+        "source": source,
+    })
+    BUDGET_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Budget entry: %s +%s (%s/%s)", team_name, amount, payment_type, platform)
+
+
+def get_team_budget_today(team_name: str) -> dict:
+    """Get today's budget summary for a team."""
+    data = load_budget_data()
+    today = _now_egypt().strftime("%Y-%m-%d")
+    today_entries = [d for d in data if d["team"] == team_name and d["date"] == today]
+
+    total = sum(d["amount"] for d in today_entries)
+    by_type = {}
+    for d in today_entries:
+        by_type[d["type"]] = by_type.get(d["type"], 0) + d["amount"]
+
+    return {"total": total, "by_type": by_type, "entries": today_entries}
+
+
+def get_team_budget_month(team_name: str) -> dict:
+    """Get this month's budget summary for a team."""
+    data = load_budget_data()
+    month = _now_egypt().strftime("%Y-%m")
+    month_entries = [d for d in data if d["team"] == team_name and d["date"].startswith(month)]
+
+    total = sum(d["amount"] for d in month_entries)
+    return {"total": total, "count": len(month_entries)}

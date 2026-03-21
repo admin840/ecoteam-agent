@@ -348,6 +348,64 @@ async def daily_noon_report(context: ContextTypes.DEFAULT_TYPE):
     await notify_owner(context, "\n".join(lines))
 
 
+async def proactive_check(context: ContextTypes.DEFAULT_TYPE):
+    """1:30 PM Egypt - proactive sheet check after master update."""
+    from analyzer import proactive_sheet_check
+    alerts = await proactive_sheet_check()
+    if not alerts:
+        await notify_owner(context, "✅ مراجعة الشيتات: كل حاجة تمام!")
+        return
+
+    lines = ["🔍 مراجعة تلقائية للشيتات:\n"]
+    critical = [a for a in alerts if a["severity"] == "critical"]
+    warnings = [a for a in alerts if a["severity"] == "warning"]
+    info = [a for a in alerts if a["severity"] == "info"]
+
+    if critical:
+        lines.append("🚨 مشاكل حرجة:")
+        for a in critical:
+            lines.append(f"  {a['msg']}")
+        lines.append("")
+
+    if warnings:
+        lines.append("⚠️ تحذيرات:")
+        for a in warnings:
+            lines.append(f"  {a['msg']}")
+        lines.append("")
+
+    if info:
+        lines.append("📋 ملاحظات:")
+        for a in info[:5]:  # Max 5
+            lines.append(f"  {a['msg']}")
+
+    await notify_owner(context, "\n".join(lines))
+
+    # Also alert team leaders with critical issues
+    for a in critical:
+        team = a["team"]
+        gid = next((g for g, n in TEAMS.items() if n == team), None)
+        if gid and gid not in paused_teams:
+            await send_to_group(context, gid,
+                f"⚠️ يا {a['leader']}، {a['msg']}\nمحتاج أفهم إيه اللي حصل؟")
+
+
+async def smart_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    """2:00 PM Egypt - AI-powered daily report to owner."""
+    from analyzer import generate_smart_daily_report, trigger_master_update
+
+    # First trigger master sheet update
+    updated = await trigger_master_update()
+    if updated:
+        logger.info("Master sheet updated before daily report")
+
+    # Generate smart report
+    report = await generate_smart_daily_report()
+    if report:
+        await notify_owner(context, f"📊 التقرير اليومي الذكي:\n\n{report}")
+    else:
+        await notify_owner(context, "⚠️ مش قادر أعمل التقرير - مفيش بيانات كافية")
+
+
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     """Midnight Egypt - reset daily tracking."""
     morning_photos.clear()
@@ -1300,6 +1358,10 @@ def main():
     jq.run_daily(auto_afternoon_reminder, time=time(hour=16, minute=0, tzinfo=egypt_tz))
     # Daily summary: 12:00 PM Egypt
     jq.run_daily(daily_noon_report, time=time(hour=12, minute=0, tzinfo=egypt_tz))
+    # Proactive sheet check: 1:30 PM (after master sheet updates at 1 PM)
+    jq.run_daily(proactive_check, time=time(hour=13, minute=30, tzinfo=egypt_tz))
+    # Smart AI daily report: 2:00 PM
+    jq.run_daily(smart_daily_report, time=time(hour=14, minute=0, tzinfo=egypt_tz))
     # Daily reset: midnight Egypt
     jq.run_daily(daily_reset, time=time(hour=0, minute=5, tzinfo=egypt_tz))
     # Weekly + salary check: 10:00 AM Egypt
