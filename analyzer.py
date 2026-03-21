@@ -85,6 +85,120 @@ def get_team_history(all_data: list[dict], team_name: str, days: int = 7) -> lis
 
 
 # ══════════════════════════════════════════════════════════════════════
+# INDIVIDUAL TEAM SHEET - read directly from team's own Google Sheet
+# ══════════════════════════════════════════════════════════════════════
+
+import csv
+import io as _io
+
+def _current_sheet_tab() -> str:
+    """Get current month's tab name: 'التقرير اليومي (March-2026)'"""
+    now = datetime.now()
+    return f"التقرير اليومي ({now.strftime('%B-%Y')})"
+
+
+async def fetch_team_sheet(team_name: str) -> list[dict]:
+    """
+    Read data directly from a team's individual Google Sheet.
+    Uses the Google Sheets CSV export (no API key needed if sheet is shared).
+    Returns list of row dicts with the team's daily data.
+
+    Columns: Date, Spend, New Orders, Yesterday New, Delivered, Cancel, Hold,
+             CPO, Daily Target, Gap, Lamp, Del%, Cancel%, Hold%
+    """
+    info = TEAM_INFO.get(team_name)
+    if not info or not info.get("sheet_id"):
+        return []
+
+    sheet_id = info["sheet_id"]
+    tab_name = _current_sheet_tab()
+
+    # Google Sheets CSV export URL
+    import urllib.parse
+    encoded_tab = urllib.parse.quote(tab_name)
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_tab}"
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                logger.warning("Team sheet fetch failed for %s: HTTP %d", team_name, resp.status_code)
+                return []
+
+            text = resp.text
+            if not text or "<!DOCTYPE" in text[:100]:
+                # Got HTML instead of CSV = sheet not shared/accessible
+                logger.warning("Team sheet not accessible for %s (got HTML)", team_name)
+                return []
+
+            # Parse CSV
+            reader = csv.DictReader(_io.StringIO(text))
+            rows = []
+            for row in reader:
+                # Skip empty rows
+                if not any(v.strip() for v in row.values()):
+                    continue
+                rows.append(dict(row))
+
+            logger.info("Fetched %d rows from %s team sheet", len(rows), team_name)
+            return rows
+
+    except Exception as e:
+        logger.warning("Team sheet fetch error for %s: %s", team_name, e)
+        return []
+
+
+def get_team_sheet_today(rows: list[dict]) -> dict | None:
+    """Get latest data row from team sheet (last row with a date)."""
+    if not rows:
+        return None
+    # Find last row that looks like it has a date (contains /)
+    for row in reversed(rows):
+        first_val = list(row.values())[0] if row else ""
+        if "/" in str(first_val) and len(str(first_val)) <= 12:
+            # Check if row has some actual data (not just a date)
+            vals = list(row.values())[1:]
+            if any(str(v).strip() and str(v).strip() != "" for v in vals):
+                return row
+    return None
+
+
+def get_team_sheet_recent(rows: list[dict], n: int = 5) -> list[dict]:
+    """Get last N data rows from team sheet."""
+    data_rows = []
+    for row in rows:
+        first_val = list(row.values())[0] if row else ""
+        if "/" in str(first_val) and len(str(first_val)) <= 12:
+            vals = list(row.values())[1:]
+            if any(str(v).strip() for v in vals):
+                data_rows.append(row)
+    return data_rows[-n:]
+
+
+def format_team_sheet_data(row: dict) -> str:
+    """Format team sheet row - pass all non-empty values."""
+    if not row:
+        return "مفيش بيانات"
+    parts = []
+    for k, v in row.items():
+        v_str = str(v).strip()
+        if v_str and v_str != "" and k.strip():
+            parts.append(f"  {k}: {v_str}")
+    return "\n".join(parts)
+
+
+def format_team_sheet_table(rows: list[dict]) -> str:
+    """Format multiple team sheet rows into a readable table."""
+    if not rows:
+        return ""
+    parts = []
+    for row in rows:
+        vals = [f"{str(v).strip()}" for v in row.values() if str(v).strip()]
+        parts.append(" | ".join(vals))
+    return "\n".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 1. CONVERSATION MEMORY - per-team context tracking
 # ══════════════════════════════════════════════════════════════════════
 
@@ -374,12 +488,18 @@ def rank_teams(all_data: list[dict]) -> dict:
 async def build_team_context(team_name: str, all_data: list[dict] | None = None) -> dict:
     """
     Build rich context for any team analysis.
-    This is the core intelligence - gathers everything Claude needs.
+    Uses team's OWN sheet as primary source, falls back to master sheet.
     """
     if all_data is None:
         all_data = await fetch_master_data()
 
     leader = get_leader(team_name)
+
+    # PRIMARY: Try to read team's own sheet first
+    team_sheet_rows = await fetch_team_sheet(team_name)
+    team_sheet_today = get_team_sheet_today(team_sheet_rows) if team_sheet_rows else None
+
+    # FALLBACK: Master sheet data
     today_data = get_team_today_data(all_data, team_name)
     history = get_team_history(all_data, team_name, days=7)
     anomalies = detect_anomalies(history)
@@ -418,6 +538,8 @@ async def build_team_context(team_name: str, all_data: list[dict] | None = None)
         "team_name": team_name,
         "leader": leader,
         "today": today_data,
+        "team_sheet_today": team_sheet_today,  # from team's own sheet (primary)
+        "team_sheet_rows": team_sheet_rows,     # all rows from team sheet
         "history": history,
         "trend": trend,
         "anomalies": anomalies,
@@ -449,10 +571,16 @@ def format_context_for_prompt(ctx: dict) -> str:
     trend_emoji = {"improving": "📈 بيتحسن", "declining": "📉 بيوحش", "stable": "➡️ مستقر"}.get(ctx["trend"], "❓")
     parts.append(f"الاتجاه: {trend_emoji}")
 
-    # Today data
+    # Team's own sheet data (PRIMARY source)
+    team_sheet = ctx.get("team_sheet_today")
+    if team_sheet:
+        parts.append("\n## بيانات شيت الفريق (المصدر الأساسي):")
+        parts.append(format_team_sheet_data(team_sheet))
+
+    # Master sheet data (SECONDARY/fallback)
     today = ctx.get("today")
     if today:
-        parts.append("\n## بيانات الشيت اليوم:")
+        parts.append("\n## بيانات الشيت المجمع:")
         for k, v in today.items():
             if v and v != "-" and v != "":
                 parts.append(f"  {k}: {v}")
@@ -825,8 +953,20 @@ async def smart_analysis(
     ctx = await build_team_context(team_name, all_data)
     context_text = format_context_for_prompt(ctx)
 
-    # Verify screenshot vs sheet
-    verification = verify_screenshot_vs_sheet(screenshot_data, ctx["today"])
+    # Verify screenshot vs sheet - use team's own sheet first, then master
+    verify_source = None
+    if ctx.get("team_sheet_today"):
+        # Convert team sheet format to master sheet format for comparison
+        ts = ctx["team_sheet_today"]
+        verify_source = {
+            "Spend اليوم": ts.get("Spend", ""),
+            "Orders اليوم": ts.get("New Orders", ""),
+            "CPO اليوم": ts.get("CPO", ""),
+        }
+    elif ctx.get("today"):
+        verify_source = ctx["today"]
+
+    verification = verify_screenshot_vs_sheet(screenshot_data, verify_source)
     verification_text = verification["summary"]
 
     # Screenshot data section
