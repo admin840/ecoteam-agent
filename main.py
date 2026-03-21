@@ -298,12 +298,13 @@ async def daily_noon_report(context: ContextTypes.DEFAULT_TYPE):
         sheet_data = get_team_today_data(all_data, name)
         sheet_line = ""
         if sheet_data:
-            spend = sheet_data.get("Spend اليوم", 0)
-            orders = sheet_data.get("Orders اليوم", 0)
+            from analyzer import _safe_num as _sn
+            spend = _sn(sheet_data.get("Spend اليوم", 0)) or 0
+            orders = _sn(sheet_data.get("Orders اليوم", 0)) or 0
             cpo = sheet_data.get("CPO اليوم", "-")
             action = sheet_data.get("\U0001f6a6 اليوم", "")
             if spend or orders:
-                sheet_line = f"\n     💰{spend:,} | 📦{orders} | CPO:{cpo} {action}"
+                sheet_line = f"\n     💰{spend:,.0f} | 📦{int(orders)} | CPO:{cpo} {action}"
 
         lines.append(f"  {icon} {name} ({leader}){paused}{sheet_line}")
 
@@ -548,14 +549,15 @@ async def compare_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    spend = today_data.get("Spend اليوم", 0)
-    orders = today_data.get("Orders اليوم", 0)
+    from analyzer import _safe_num
+    spend = _safe_num(today_data.get("Spend اليوم", 0)) or 0
+    orders = _safe_num(today_data.get("Orders اليوم", 0)) or 0
     cpo = today_data.get("CPO اليوم", "-")
     action_today = today_data.get("\U0001f6a6 اليوم", "")
     spend_y = today_data.get("Spend أمس", "-")
-    delivered = today_data.get("Delivered", 0)
-    cancel = today_data.get("Cancel", 0)
-    hold = today_data.get("Hold", 0)
+    delivered = _safe_num(today_data.get("Delivered", 0)) or 0
+    cancel = _safe_num(today_data.get("Cancel", 0)) or 0
+    hold = _safe_num(today_data.get("Hold", 0)) or 0
     cancel_pct = today_data.get("Cancel%", "0%")
     cpa = today_data.get("CPA الحقيقي", "-")
     action_yest = today_data.get("\U0001f6a6 أمس", "")
@@ -782,6 +784,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if gid not in TEAMS:
         return
 
+    # Owner sends photo in group → bot stays silent (just observe)
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id == OWNER_CHAT_ID:
+        return
+
     from analyzer import (
         analyze_screenshot, smart_analysis,
         generate_quick_summary, get_leader,
@@ -919,6 +926,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gid = update.effective_chat.id
     if gid not in TEAMS:
         return
+    # Owner sends video in group → bot stays silent
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id == OWNER_CHAT_ID:
+        return
     from analyzer import analyze_video_creative, get_leader
     name = team_name(gid)
     leader = get_leader(name)
@@ -987,6 +998,19 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_to = ""
     if update.message.reply_to_message:
         reply_to = update.message.reply_to_message.text or ""
+
+    # ── Check if this is an image type correction ──
+    waiting_imgtype = context.chat_data.get("waiting_imgtype_correction", False)
+    if waiting_imgtype:
+        from analyzer import save_image_pattern, save_learning
+        # User told us what the image really is
+        save_image_pattern(text, text.strip())
+        save_learning(name, "image_type", "نوع صورة غلط", f"التيم ليدر قال: {text}")
+        context.chat_data["waiting_imgtype_correction"] = False
+        await update.message.reply_text(
+            f"✅ اتعلمت يا {leader}! المرة الجاية هعرفها لوحدي 💪"
+        )
+        return
 
     # ── Check if this is a correction after user clicked ❌ or ✏️ ──
     waiting = context.chat_data.get("waiting_correction", False)
@@ -1110,11 +1134,9 @@ async def handle_imgtype_callback(update: Update, context: ContextTypes.DEFAULT_
         )
 
         # Now process the image normally
-        # Re-trigger analysis with confirmed type
         image_bytes = context.chat_data.get("pending_image")
         if image_bytes:
-            pending_result["_low_confidence"] = False  # Now we're confident
-            # Continue processing...
+            pending_result["_low_confidence"] = False
             from analyzer import (
                 handle_non_report_image, smart_analysis,
                 generate_quick_summary, REPORT_IMAGE_TYPES,
@@ -1131,18 +1153,37 @@ async def handle_imgtype_callback(update: Update, context: ContextTypes.DEFAULT_
                     )
                     _last_bot_analysis[gid] = response
             else:
+                # Count toward report requirement
+                hour_now = now_egypt().hour
+                if hour_now < 16:
+                    count = morning_photos.get(gid, 0) + 1
+                    morning_photos[gid] = count
+                    required = MORNING_REQUIRED
+                else:
+                    count = afternoon_photos.get(gid, 0) + 1
+                    afternoon_photos[gid] = count
+                    required = AFTERNOON_REQUIRED
+                period = "الصبح" if hour_now < 16 else "العصر"
+
                 result = pending_result
                 if "error" not in result:
                     summary = generate_quick_summary(result)
                     report_type = context.chat_data.get("pending_report_type", "morning")
                     analysis = await smart_analysis(name, result, report_type, image_bytes)
                     if analysis:
+                        leader = get_leader(name)
+                        header = f"📸 تقرير {period}: ({count}/{required})\n{summary}\n\n"
                         await context.bot.send_message(
                             chat_id=gid,
-                            text=f"🤖 {summary}\n\n{analysis}",
+                            text=header + analysis,
                             reply_markup=feedback_keyboard(),
                         )
                         _last_bot_analysis[gid] = analysis
+                    if count == required:
+                        leader = get_leader(name)
+                        await context.bot.send_message(
+                            chat_id=gid, text=f"✅ تقرير {period} مكتمل! شكراً {leader} 🎉"
+                        )
 
         # Clean up
         context.chat_data.pop("pending_image", None)
@@ -1247,7 +1288,7 @@ def main():
     app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forwarded))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION, handle_video))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.REPLY, handle_group_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_text))
 
     # ══ Scheduled jobs (Egypt timezone) ══
     jq = app.job_queue

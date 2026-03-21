@@ -13,10 +13,15 @@ import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import httpx
 import anthropic
 
 logger = logging.getLogger(__name__)
+EGYPT_TZ = ZoneInfo("Africa/Cairo")
+
+def _now_egypt():
+    return datetime.now(EGYPT_TZ)
 
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 MASTER_SHEET_URL = os.environ.get("MASTER_SHEET_URL", "")
@@ -131,7 +136,7 @@ def save_learning(team_name: str, category: str, what_bot_said: str, correction:
     """Save a correction so the bot learns from it."""
     data = load_learnings()
     data.append({
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "date": _now_egypt().strftime("%Y-%m-%d %H:%M"),
         "team": team_name,
         "category": category,  # "image_type", "numbers", "analysis", "other"
         "bot_said": what_bot_said[:300],
@@ -217,7 +222,7 @@ import io as _io
 
 def _current_sheet_tab() -> str:
     """Get current month's tab name: 'March-2026' (cycle runs 26th to 25th)."""
-    now = datetime.now()
+    now = _now_egypt()
     # Month cycle: 26th to 25th. If we're before 26th, use current month name.
     # If 26th or later, use next month name.
     if now.day >= 26:
@@ -756,7 +761,7 @@ def format_context_for_prompt(ctx: dict) -> str:
     team = ctx["team_name"]
 
     parts.append(f"## فريق: {team} | التيم ليدر: {leader}")
-    parts.append(f"التاريخ: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    parts.append(f"التاريخ: {_now_egypt().strftime('%Y-%m-%d %H:%M')}")
 
     # Rank
     if ctx["rank"]:
@@ -966,6 +971,10 @@ async def classify_image(image_bytes: bytes) -> dict:
 
         result = json.loads(response_text)
         confidence = result.get("confidence", 0)
+        # Normalize: Claude might return 0-100 instead of 0-1
+        if isinstance(confidence, (int, float)) and confidence > 1:
+            confidence = confidence / 100
+        result["confidence"] = confidence
         description = result.get("description", "")
 
         # Check if learned patterns override the classification
@@ -1108,6 +1117,7 @@ async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: st
         result = json.loads(cleaned)
         result["_raw"] = response_text
         result["image_type"] = img_type
+        result["_low_confidence"] = classification.get("_low_confidence", False)
         return result
 
     except json.JSONDecodeError:
@@ -1160,15 +1170,7 @@ async def handle_non_report_image(
         "fb_payment": payment_instruction,
         "tt_payment": payment_instruction,
 
-        "creative_image": f"""الصورة دي creative أو إعلان مصمم.
-
-حلل الـ Creative بسرعة:
-- التصميم كويس؟
-- الرسالة واضحة؟
-- الـ CTA موجود؟
-- نصيحة سريعة واحدة
-
-خاطب {leader} بالاسم. 3-4 سطور ماكس.""",
+        "creative_image": "__USE_FULL_CREATIVE_ANALYSIS__",
 
         "other": f"""رد بسطر واحد: "تم استلام الصورة ✅"
 متحللش ومتسألش.
@@ -1176,6 +1178,10 @@ async def handle_non_report_image(
     }
 
     prompt = type_instructions.get(image_type, type_instructions["other"])
+
+    # Creative images get full scorecard analysis
+    if prompt == "__USE_FULL_CREATIVE_ANALYSIS__":
+        return await analyze_image_creative(image_bytes, team_name)
 
     try:
         client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
@@ -1497,23 +1503,22 @@ async def analyze_text_message(team_name: str, text: str, reply_to_text: str = "
 def generate_quick_summary(screenshot_data: dict) -> str:
     """Generate a quick one-line summary of extracted data."""
     parts = []
-    spend = screenshot_data.get("spend")
-    orders = screenshot_data.get("orders") or screenshot_data.get("results")
-    cpo = screenshot_data.get("cpo")
-    cpa = screenshot_data.get("cpa")
+    spend = _safe_num(screenshot_data.get("spend"))
+    orders = _safe_num(screenshot_data.get("orders") or screenshot_data.get("results"))
+    cpo = _safe_num(screenshot_data.get("cpo"))
+    cpa = _safe_num(screenshot_data.get("cpa"))
 
-    if spend is not None:
+    if spend and spend > 0:
         parts.append(f"Spend: {spend:,.0f}")
-    if orders is not None:
-        parts.append(f"Orders: {orders}")
-    if cpo is not None:
+    if orders and orders > 0:
+        parts.append(f"Orders: {int(orders)}")
+    if cpo and cpo > 0:
         parts.append(f"CPO: {cpo:,.0f}")
     elif spend and orders and orders > 0:
         parts.append(f"CPO: {spend/orders:,.0f}")
-    if cpa is not None:
+    if cpa and cpa > 0:
         parts.append(f"CPA: {cpa:,.0f}")
 
-    # If data came from sheet directly, add indicator
     if screenshot_data.get("_from_sheet"):
         return "📋 " + (" | ".join(parts) if parts else "تم استلام الصورة")
 
