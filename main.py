@@ -55,9 +55,40 @@ MORNING_REQUIRED = 3
 AFTERNOON_REQUIRED = 3
 
 # ── State tracking ───────────────────────────────────────────────────
-morning_photos: dict[int, int] = {}
+# Track WHAT was sent, not just how many
+# Keys: gid -> set of received categories ("sheet", "budget", "dashboard")
+morning_photos: dict[int, int] = {}          # backward compat for count
 afternoon_photos: dict[int, int] = {}
+morning_types: dict[int, set[str]] = {}      # NEW: what types were received
+afternoon_types: dict[int, set[str]] = {}
 paused_teams: set[int] = set()
+
+# Map image types to the 3 required report categories
+REPORT_CATEGORY_MAP = {
+    "order_sheet": "sheet",
+    "budget_sheet": "budget",
+    "fb_payment": "budget",      # payment counts as budget proof
+    "tt_payment": "budget",
+    "fb_ads_dashboard": "dashboard",
+    "tt_ads_dashboard": "dashboard",
+}
+
+REPORT_CATEGORY_LABELS = {
+    "sheet": "شيت الطلبات اليومي",
+    "budget": "البادجيت المصروف / إيصال الدفع",
+    "dashboard": "داشبورد الإعلانات",
+}
+
+def get_missing_categories(gid: int, period: str) -> list[str]:
+    """Get list of missing report categories for a team."""
+    types = morning_types.get(gid, set()) if period == "morning" else afternoon_types.get(gid, set())
+    all_cats = {"sheet", "budget", "dashboard"}
+    return [REPORT_CATEGORY_LABELS[c] for c in all_cats - types]
+
+def get_received_categories(gid: int, period: str) -> list[str]:
+    """Get list of received report categories for a team."""
+    types = morning_types.get(gid, set()) if period == "morning" else afternoon_types.get(gid, set())
+    return [REPORT_CATEGORY_LABELS[c] for c in types]
 
 # Conversation states
 ALERT_PICK_TEAM, ALERT_TYPE_MSG, ALERT_CONFIRM = range(3)
@@ -258,18 +289,22 @@ async def auto_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
         leader = get_leader(name)
         count = morning_photos.get(gid, 0)
 
-        if count >= MORNING_REQUIRED:
+        received = get_received_categories(gid, "morning")
+        missing_cats = get_missing_categories(gid, "morning")
+
+        if not missing_cats:
             already_done += 1
             await send_to_group(context, gid,
                 f"صباح الخير يا {leader}! 🌅\nتقريرك مكتمل ✅ شكراً إنك بعتت بدري 💪")
-        elif count > 0:
+        elif received:
             partial += 1
-            missing = MORNING_REQUIRED - count
+            received_text = " ✅\n- ".join(received)
+            missing_text = "\n- ".join(missing_cats)
             await send_to_group(context, gid,
                 f"صباح الخير يا {leader}! 🌅\n"
-                f"أنا وصلني {count} صور من التقرير - شكراً ليك 🙏\n"
-                f"لو في حاجة تانية ممكن تبعتها تاني عشان أشوفها؟\n"
-                f"المطلوب {MORNING_REQUIRED} screenshots (شيت + بادجيت + داشبورد)")
+                f"وصلني وشكراً ليك 🙏:\n- {received_text} ✅\n\n"
+                f"لسه مستني:\n- {missing_text}\n"
+                f"ابعتهم لما يكونوا جاهزين 💪")
         else:
             sent_count += 1
             await send_to_group(context, gid, MORNING_MSG)
@@ -296,17 +331,22 @@ async def auto_afternoon_reminder(context: ContextTypes.DEFAULT_TYPE):
         leader = get_leader(name)
         count = afternoon_photos.get(gid, 0)
 
-        if count >= AFTERNOON_REQUIRED:
+        received = get_received_categories(gid, "afternoon")
+        missing_cats = get_missing_categories(gid, "afternoon")
+
+        if not missing_cats:
             already_done += 1
             await send_to_group(context, gid,
                 f"مساء الخير يا {leader}! 🌇\nتقرير العصر مكتمل ✅ شكراً 💪")
-        elif count > 0:
+        elif received:
             partial += 1
+            received_text = " ✅\n- ".join(received)
+            missing_text = "\n- ".join(missing_cats)
             await send_to_group(context, gid,
                 f"مساء الخير يا {leader}! 🌇\n"
-                f"أنا وصلني {count} صور - شكراً ليك 🙏\n"
-                f"لو في حاجة تانية ممكن تبعتها تاني عشان أشوفها؟\n"
-                f"المطلوب {AFTERNOON_REQUIRED} screenshots")
+                f"وصلني وشكراً 🙏:\n- {received_text} ✅\n\n"
+                f"لسه مستني:\n- {missing_text}")
+        else:
         else:
             sent_count += 1
             await send_to_group(context, gid, AFTERNOON_MSG)
@@ -468,6 +508,8 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
     """Midnight Egypt - reset daily tracking."""
     morning_photos.clear()
     afternoon_photos.clear()
+    morning_types.clear()
+    afternoon_types.clear()
     from analyzer import reset_conversation_memory
     reset_conversation_memory()
     logger.info("Daily tracking reset (Egypt midnight)")
@@ -983,7 +1025,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Step 2: Handle based on image type
     if img_type not in REPORT_IMAGE_TYPES:
-        # NOT a report screenshot - don't count it, respond appropriately
+        # Track payment images as "budget" category even though not a "report"
+        pay_category = REPORT_CATEGORY_MAP.get(img_type, "")
+        if pay_category:
+            if hour < 16:
+                count = morning_photos.get(gid, 0) + 1
+                morning_photos[gid] = count
+                if gid not in morning_types:
+                    morning_types[gid] = set()
+                morning_types[gid].add(pay_category)
+            else:
+                count = afternoon_photos.get(gid, 0) + 1
+                afternoon_photos[gid] = count
+                if gid not in afternoon_types:
+                    afternoon_types[gid] = set()
+                afternoon_types[gid].add(pay_category)
+
         try:
             response = await handle_non_report_image(
                 image_bytes, name, img_type, result.get("description", "")
@@ -996,16 +1053,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _last_bot_analysis[gid] = response
         except Exception as e:
             logger.error("Non-report image error (%s): %s", name, e)
-        return  # Don't count, don't analyze further
+        return
 
-    # Step 3: It's a report screenshot - count it
+    # Step 3: It's a report screenshot - count it AND track its type
+    category = REPORT_CATEGORY_MAP.get(img_type, "")
+
     if hour < 16:
         count = morning_photos.get(gid, 0) + 1
         morning_photos[gid] = count
+        if category:
+            if gid not in morning_types:
+                morning_types[gid] = set()
+            morning_types[gid].add(category)
         required = MORNING_REQUIRED
     else:
         count = afternoon_photos.get(gid, 0) + 1
         afternoon_photos[gid] = count
+        if category:
+            if gid not in afternoon_types:
+                afternoon_types[gid] = set()
+            afternoon_types[gid].add(category)
         required = AFTERNOON_REQUIRED
 
     period = "الصبح" if hour < 16 else "العصر"
@@ -1014,10 +1081,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "error" not in result:
         summary = generate_quick_summary(result)
 
+        # Show what category this photo is
+        cat_label = REPORT_CATEGORY_LABELS.get(category, "")
+        remaining = get_missing_categories(gid, "morning" if hour < 16 else "afternoon")
+        remaining_text = f"\nلسه مستني: {' + '.join(remaining)}" if remaining else "\n✅ التقرير مكتمل!"
+
         analysis = await smart_analysis(name, result, report_type, image_bytes)
         if analysis:
-            # Send count + analysis + feedback buttons
-            header = f"📸 تقرير {period}: ({count}/{required})\n🤖 {summary}\n\n"
+            header = f"📸 تقرير {period}: {cat_label} ✅\n{summary}{remaining_text}\n\n"
             await update.message.reply_text(
                 header + analysis,
                 reply_markup=feedback_keyboard(),
@@ -1030,8 +1101,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"📸 تقرير {period}: ({count}/{required})")
 
-    # Step 5: Completion message
-    if count == required:
+    # Step 5: Completion message - check by categories not just count
+    missing_cats = get_missing_categories(gid, "morning" if hour < 16 else "afternoon")
+    if not missing_cats:
         await update.message.reply_text(f"✅ تقرير {period} مكتمل! شكراً {leader} 🎉")
 
 
