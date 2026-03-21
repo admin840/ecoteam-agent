@@ -307,10 +307,35 @@ def get_team_sheet_today(rows: list[dict]) -> dict | None:
     if not rows:
         return None
     for row in reversed(rows):
-        spend = row.get("Spend", "").strip()
+        spend_str = row.get("Spend", "").strip().replace(",", "")
         # Must have a non-zero spend value
-        if spend and spend != "0" and spend != "0.00":
+        try:
+            spend_val = float(spend_str) if spend_str else 0
+        except ValueError:
+            spend_val = 0
+        if spend_val > 0:
             return row
+    return None
+
+
+def calculate_cpa_from_sheet(rows: list[dict]) -> float | None:
+    """
+    Calculate CPA correctly:
+    CPA = Spend from PREVIOUS row ÷ Delivered from CURRENT (latest) row.
+    Because delivery of day X is recorded in day X+1's row.
+    """
+    data_rows = [r for r in rows if _safe_num(r.get("Spend")) and _safe_num(r.get("Spend")) > 0]
+    if len(data_rows) < 2:
+        return None
+
+    current_row = data_rows[-1]  # Latest row
+    previous_row = data_rows[-2]  # Previous row
+
+    prev_spend = _safe_num(previous_row.get("Spend"))
+    curr_delivered = _safe_num(current_row.get("Delivered"))
+
+    if prev_spend and prev_spend > 0 and curr_delivered and curr_delivered > 0:
+        return round(prev_spend / curr_delivered)
     return None
 
 
@@ -955,11 +980,14 @@ async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: st
             spend = _safe_num(today_row.get("Spend", ""))
             orders = _safe_num(today_row.get("New Orders", ""))
             cpo = _safe_num(today_row.get("CPO", ""))
+            # Calculate CPA correctly from sheet rows
+            cpa = calculate_cpa_from_sheet(team_rows)
             return {
                 "image_type": img_type,
                 "spend": spend,
                 "orders": orders,
                 "cpo": cpo,
+                "cpa": cpa,
                 "delivered": _safe_num(today_row.get("Delivered", "")),
                 "cancel": _safe_num(today_row.get("Cancel", "")),
                 "hold": _safe_num(today_row.get("Hold", "")),
@@ -967,7 +995,14 @@ async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: st
                 "notes": "تم قراءة الأرقام من الشيت مباشرة",
                 "_from_sheet": True,
             }
-        # If can't read sheet, fall through to image extraction
+        # If can't read sheet directly, return basic result - DON'T extract MTD totals from image
+        logger.warning("Could not read team sheet for %s, returning basic classification", team_name)
+        return {
+            "image_type": img_type,
+            "description": img_desc,
+            "notes": "مش قادر أقرأ الشيت مباشرة - هبص على الصورة",
+            "_sheet_read_failed": True,
+        }
 
     # Step 3: Extract numbers from image (for ads dashboards)
     leader = get_leader(team_name)
@@ -1138,7 +1173,11 @@ async def smart_analysis(
 
     # ── Team sheet data (PRIMARY source for comparison) ──
     team_sheet = ctx.get("team_sheet_today")
-    team_sheet_recent = get_team_sheet_recent(ctx.get("team_sheet_rows", []), 5)
+    team_sheet_rows = ctx.get("team_sheet_rows", [])
+    team_sheet_recent = get_team_sheet_recent(team_sheet_rows, 5)
+
+    # Calculate CPA correctly from team sheet
+    cpa_real = calculate_cpa_from_sheet(team_sheet_rows) if team_sheet_rows else None
 
     # Build team sheet section for prompt
     ts_text = ""
@@ -1152,6 +1191,8 @@ async def smart_analysis(
         ts_text += f"  Cancel: {team_sheet.get('Cancel', '-')}\n"
         ts_text += f"  Hold: {team_sheet.get('Hold', '-')}\n"
         ts_text += f"  CPO: {team_sheet.get('CPO', '-')}\n"
+        if cpa_real:
+            ts_text += f"  CPA الحقيقي (Spend أمس ÷ Delivered اليوم): {cpa_real}\n"
         ts_text += f"  🚦: {team_sheet.get('Lamp', '-')}\n"
         ts_text += f"  Del%: {team_sheet.get('Del%', '-')} | Cancel%: {team_sheet.get('Cancel%', '-')} | Hold%: {team_sheet.get('Hold%', '-')}\n"
 
@@ -1389,6 +1430,7 @@ def generate_quick_summary(screenshot_data: dict) -> str:
     spend = screenshot_data.get("spend")
     orders = screenshot_data.get("orders") or screenshot_data.get("results")
     cpo = screenshot_data.get("cpo")
+    cpa = screenshot_data.get("cpa")
 
     if spend is not None:
         parts.append(f"Spend: {spend:,.0f}")
@@ -1398,8 +1440,14 @@ def generate_quick_summary(screenshot_data: dict) -> str:
         parts.append(f"CPO: {cpo:,.0f}")
     elif spend and orders and orders > 0:
         parts.append(f"CPO: {spend/orders:,.0f}")
+    if cpa is not None:
+        parts.append(f"CPA: {cpa:,.0f}")
 
-    return " | ".join(parts) if parts else "تم استلام الصورة"
+    # If data came from sheet directly, add indicator
+    if screenshot_data.get("_from_sheet"):
+        return "📋 " + (" | ".join(parts) if parts else "تم استلام الصورة")
+
+    return "🤖 " + (" | ".join(parts) if parts else "تم استلام الصورة")
 
 
 # ══════════════════════════════════════════════════════════════════════

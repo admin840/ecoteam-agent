@@ -833,6 +833,31 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["pending_report_type"] = report_type
         return
 
+    # Step 2a: If sheet read failed for order_sheet, handle specially
+    if result.get("_sheet_read_failed"):
+        # Try to analyze with smart_analysis using whatever data we have
+        hour_now = now_egypt().hour
+        if hour_now < 16:
+            count = morning_photos.get(gid, 0) + 1
+            morning_photos[gid] = count
+        else:
+            count = afternoon_photos.get(gid, 0) + 1
+            afternoon_photos[gid] = count
+        period = "الصبح" if hour_now < 16 else "العصر"
+        required = MORNING_REQUIRED if hour_now < 16 else AFTERNOON_REQUIRED
+
+        from analyzer import smart_analysis as _sa
+        analysis = await _sa(name, result, report_type, image_bytes)
+        if analysis:
+            await update.message.reply_text(
+                f"📸 تقرير {period}: ({count}/{required})\n\n{analysis}",
+                reply_markup=feedback_keyboard(),
+            )
+            _last_bot_analysis[gid] = analysis
+        else:
+            await update.message.reply_text(f"📸 تقرير {period}: ({count}/{required})\n📋 تم استلام صورة الشيت")
+        return
+
     # Step 2: Handle based on image type
     if img_type not in REPORT_IMAGE_TYPES:
         # NOT a report screenshot - don't count it, respond appropriately
