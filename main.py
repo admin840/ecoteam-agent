@@ -714,31 +714,43 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         m_received = get_received_categories(gid, "morning")
         m_missing = get_missing_categories(gid, "morning")
 
-        # Source 2: Team sheet (is it updated today?)
+        # Source 2: Team sheet (is it updated today?) - PRIMARY source of truth
+        sheet_updated = False
         sheet_status = ""
         try:
             rows = await fetch_team_sheet(name)
             today_row = get_team_sheet_today(rows) if rows else None
             if today_row:
+                sheet_updated = True
                 spend = _safe_num(today_row.get("Spend", ""))
                 orders = _safe_num(today_row.get("New Orders", ""))
                 cpo = _safe_num(today_row.get("CPO", ""))
-                sheet_status = f" | 📋 Spend:{spend:,.0f} Orders:{orders:.0f}"
+                sheet_status = f"\n     📋 Spend:{spend:,.0f} | Orders:{orders:.0f}"
                 if cpo and cpo > 0:
                     emoji = "🟢" if cpo <= 150 else "🟡" if cpo <= 180 else "🔴"
-                    sheet_status += f" CPO:{cpo:.0f}{emoji}"
+                    sheet_status += f" | CPO:{cpo:.0f}{emoji}"
             else:
-                sheet_status = " | 📋 الشيت لسه"
+                sheet_status = "\n     📋 الشيت لسه"
         except Exception:
             sheet_status = ""
 
+        # Determine status: use BOTH sources
         if not m_missing:
+            # All 3 categories received via photos
             done_list.append(f"  ✅ {name} ({leader}){sheet_status}{paused}")
-        elif m_received:
-            received_short = ", ".join(m_received)
+        elif sheet_updated and m_received:
+            # Sheet updated + some photos
             done_count = 3 - len(m_missing)
-            partial_list.append(f"  🟡 {name} ({leader}) [{done_count}/3]{sheet_status}{paused}")
+            done_list.append(f"  ✅ {name} ({leader}) [{done_count}/3 صور]{sheet_status}{paused}")
+        elif sheet_updated and not m_received:
+            # Sheet updated but no photos tracked (maybe sent before deploy)
+            partial_list.append(f"  🟡 {name} ({leader}) - الشيت متحدث{sheet_status}{paused}")
+        elif m_received:
+            # Some photos but sheet not updated
+            received_short = ", ".join(m_received)
+            partial_list.append(f"  🟡 {name} ({leader}) - وصل: {received_short}{paused}")
         else:
+            # Nothing at all
             missing_list.append(f"  ❌ {name} ({leader}){sheet_status}{paused}")
 
     # Step 3: Build verified response
