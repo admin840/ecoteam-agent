@@ -70,6 +70,32 @@ async def fetch_master_data() -> list[dict]:
     return []
 
 
+async def trigger_master_update() -> bool:
+    """
+    Tell Apps Script to update the master sheet NOW.
+    Call this when all teams have submitted their data.
+    Returns True if update succeeded.
+    """
+    if not MASTER_SHEET_URL:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            resp = await client.post(
+                MASTER_SHEET_URL,
+                json={"action": "update"},
+            )
+            data = resp.json()
+            if data.get("success"):
+                logger.info("Master sheet updated successfully!")
+                return True
+            else:
+                logger.error("Master sheet update failed: %s", data.get("error"))
+                return False
+    except Exception as e:
+        logger.error("Failed to trigger master update: %s", e)
+        return False
+
+
 def get_team_today_data(all_data: list[dict], team_name: str) -> dict | None:
     sheet_name = get_sheet_name(team_name)
     for row in reversed(all_data):
