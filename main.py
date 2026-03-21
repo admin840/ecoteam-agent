@@ -38,6 +38,7 @@ TEAMS: dict[int, str] = {
     -4704859302: "Trend",
     -2691026546: "Aswaq",
     -2658420756: "Flash",
+    -2546787010: "Deelat",
 }
 
 # ── Report requirements ──────────────────────────────────────────────
@@ -553,36 +554,95 @@ async def pause_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ── Photo handler: track screenshots ─────────────────────────────────
+# ── Photo handler: track screenshots + AI analysis ───────────────────
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Track photos from team groups as report screenshots."""
+    """Track photos from team groups, analyze with Claude Vision, verify numbers."""
     gid = update.effective_chat.id
     if gid not in TEAMS:
         return
 
+    from analyzer import (
+        analyze_screenshot, compare_and_verify,
+        generate_smart_summary, get_leader,
+    )
+
     name = team_name(gid)
+    leader = get_leader(name)
     now = datetime.now()
     hour = now.hour
 
-    # Determine which report this photo belongs to
+    # Determine report type based on time and photo count
     if hour < 16:
-        # Morning report (before 4 PM)
         count = morning_photos.get(gid, 0) + 1
         morning_photos[gid] = count
-        if count <= MORNING_REQUIRED:
-            await update.message.reply_text(f"📸 تقرير الصبح: ({count}/{MORNING_REQUIRED})")
-            if count == MORNING_REQUIRED:
-                await update.message.reply_text(f"✅ تقرير الصبح مكتمل! شكراً {name} 🎉")
-                logger.info("Morning report complete for %s", name)
+        required = MORNING_REQUIRED
+
+        # Determine screenshot type by order
+        if count == 1:
+            report_type = "morning_sheet"
+        elif count == 2:
+            report_type = "morning_budget"
+        elif count == 3:
+            report_type = "morning_dashboard"
+        else:
+            report_type = "morning_sheet"
+
+        if count <= required:
+            await update.message.reply_text(f"📸 تقرير الصبح: ({count}/{required})")
     else:
-        # Afternoon report (4 PM onwards)
         count = afternoon_photos.get(gid, 0) + 1
         afternoon_photos[gid] = count
-        if count <= AFTERNOON_REQUIRED:
-            await update.message.reply_text(f"📸 تقرير العصر: ({count}/{AFTERNOON_REQUIRED})")
-            if count == AFTERNOON_REQUIRED:
-                await update.message.reply_text(f"✅ تقرير العصر مكتمل! شكراً {name} 🎉")
-                logger.info("Afternoon report complete for %s", name)
+        required = AFTERNOON_REQUIRED
+        report_type = "afternoon"
+
+        if count <= required:
+            await update.message.reply_text(f"📸 تقرير العصر: ({count}/{required})")
+
+    # ── AI Analysis ──
+    try:
+        # Download the photo from Telegram
+        photo = update.message.photo[-1]  # Highest resolution
+        file = await context.bot.get_file(photo.file_id)
+        image_bytes = await file.download_as_bytearray()
+
+        # Analyze with Claude Vision
+        logger.info("Analyzing screenshot from %s (%s)...", name, report_type)
+        result = await analyze_screenshot(bytes(image_bytes), name, report_type)
+
+        if "error" not in result:
+            # Generate summary
+            summary = await generate_smart_summary(name, result)
+            await update.message.reply_text(f"🤖 {summary}")
+
+            # Compare with Master Sheet and verify
+            verification = await compare_and_verify(name, result, report_type)
+            if verification:
+                # Send warning to group
+                await update.message.reply_text(verification)
+                # Also notify owner
+                await notify_owner(
+                    context,
+                    f"🔍 تنبيه مراجعة - {name}:\n{verification}"
+                )
+        else:
+            logger.warning("Analysis failed for %s: %s", name, result.get("error"))
+
+    except Exception as e:
+        logger.error("Error analyzing photo from %s: %s", name, e)
+
+    # ── Completion message ──
+    if hour < 16:
+        if count == required:
+            await update.message.reply_text(
+                f"✅ تقرير الصبح مكتمل! شكراً {leader} 🎉"
+            )
+            logger.info("Morning report complete for %s", name)
+    else:
+        if count == required:
+            await update.message.reply_text(
+                f"✅ تقرير العصر مكتمل! شكراً {leader} 🎉"
+            )
+            logger.info("Afternoon report complete for %s", name)
 
 
 # ── Forwarded message handler ────────────────────────────────────────
