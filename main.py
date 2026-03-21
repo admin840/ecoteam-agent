@@ -75,7 +75,7 @@ def feedback_keyboard() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("✅ صح كده", callback_data="fb_correct"),
             InlineKeyboardButton("❌ مش كده", callback_data="fb_wrong"),
-            InlineKeyboardButton("💬 عندي تعليق", callback_data="fb_edit"),
+            InlineKeyboardButton("💬 تعليق الأدمن", callback_data="fb_edit"),
         ]
     ])
 
