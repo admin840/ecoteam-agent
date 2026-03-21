@@ -73,9 +73,9 @@ def feedback_keyboard() -> InlineKeyboardMarkup:
     """Inline buttons for every bot analysis."""
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ صح", callback_data="fb_correct"),
-            InlineKeyboardButton("❌ غلط", callback_data="fb_wrong"),
-            InlineKeyboardButton("✏️ هعدل", callback_data="fb_edit"),
+            InlineKeyboardButton("✅ صح كده", callback_data="fb_correct"),
+            InlineKeyboardButton("❌ مش كده", callback_data="fb_wrong"),
+            InlineKeyboardButton("💬 عندي تعليق", callback_data="fb_edit"),
         ]
     ])
 
