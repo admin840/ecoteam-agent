@@ -2209,6 +2209,105 @@ async def analyze_text_message(team_name: str, text: str, reply_to_text: str = "
 # DOCUMENT (CSV/XLSX) ANALYSIS
 # ══════════════════════════════════════════════════════════════════════
 
+async def analyze_pdf_orders(pdf_bytes: bytes, team_name: str, filename: str) -> str:
+    """Analyze a driver orders PDF - extract products, areas, quantities."""
+    if not CLAUDE_API_KEY:
+        return ""
+
+    leader = get_leader(team_name)
+    today = _now_egypt().strftime("%Y-%m-%d")
+
+    # Extract text from PDF
+    pdf_text = ""
+    try:
+        import pdfplumber
+        import io as _io2
+        with pdfplumber.open(_io2.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                pdf_text += page_text + "\n"
+                # Also try tables
+                tables = page.extract_tables()
+                for table in tables:
+                    for row in table:
+                        if row:
+                            pdf_text += " | ".join(str(c or "") for c in row) + "\n"
+    except Exception as e:
+        logger.error("PDF parse error: %s", e)
+        return f"مش قادر أقرأ الـ PDF: {e}"
+
+    if not pdf_text.strip():
+        return "الـ PDF فاضي أو مش قادر أقرأ النص منه."
+
+    # Save raw text to DB for future reference
+    db_log_conversation(team_name, leader, f"[PDF orders] {filename}", pdf_text[:500])
+
+    # Get historical context
+    db_perf = db_get_daily_performance(team_name, days=7)
+    history_text = ""
+    if db_perf:
+        history_text = "أداء آخر 7 أيام:\n"
+        for row in db_perf[-7:]:
+            history_text += f"  {row['date']}: Spend={row['spend']}, Orders={row['new_orders']}, CPO={row['cpo']}\n"
+
+    # Get learnings
+    learnings = db_get_learnings(team_name, limit=5)
+    learnings_text = ""
+    if learnings:
+        learnings_text = "\nتصحيحات سابقة:\n" + "\n".join(
+            f"  - {l['date']}: {l['correction']}" for l in learnings
+        )
+
+    prompt = f"""أنت مدير Performance Marketing + Data Analyst لفريق {team_name} (التيم ليدر: {leader}).
+
+ده شيت الطلبات للسواقين النهاردة ({filename}):
+
+{pdf_text[:8000]}
+
+{history_text}
+{learnings_text}
+
+## المطلوب (حلل كـ Data Analyst):
+1. كام طلب في الشيت النهاردة؟
+2. إيه أكتر المنتجات اتطلبت؟ (Top 5)
+3. إيه أكتر المناطق فيها طلبات؟
+4. متوسط سعر الطلب كام؟
+5. في منتجات ملفتة (كتير أو قليلة مقارنة بالعادي)؟
+6. مقارنة عدد الطلبات مع أرقام شيت التقرير (لو متاحة)
+7. توصية واحدة عملية بناءً على البيانات
+
+## قواعد:
+- ابدأ بـ "من ناحية الداتا..."
+- بالعربي المصري
+- خاطب {leader} بالاسم
+- لو مش متأكد من حاجة اسأل
+- اختم بسؤال عشان الأدمن يتفاعل
+- مختصر (6-10 سطور)"""
+
+    try:
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        message = await _retry_async(
+            client.messages.create,
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        response = message.content[0].text.strip()
+        remember_exchange(team_name, f"[تحليل شيت سواقين] {response[:200]}")
+
+        # Log to DB
+        db_log_tracking(
+            team=team_name, leader=leader, image_type="driver_orders_pdf",
+            platform="", amount="", ai_notes=response[:500],
+            task_type="morning", status="analyzed"
+        )
+        return response
+    except Exception as e:
+        logger.error("PDF analysis error: %s", e)
+        return ""
+
+
 async def analyze_document(file_content: str, team_name: str, filename: str) -> str:
     """Analyze uploaded CSV/Excel document with Claude."""
     if not CLAUDE_API_KEY:

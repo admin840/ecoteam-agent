@@ -928,19 +928,34 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     doc = msg.document
     fname = (doc.file_name or "").lower()
-    if not any(fname.endswith(ext) for ext in (".csv", ".xlsx", ".xls")):
+
+    # Accept CSV, Excel, and PDF files
+    supported = (".csv", ".xlsx", ".xls", ".pdf")
+    if not any(fname.endswith(ext) for ext in supported):
         return
 
-    await msg.reply_text("⏳ جاري تحليل الملف...")
+    leader = analyzer.get_leader(team_name)
+    await msg.reply_text(f"⏳ جاري تحليل الملف يا {leader}...")
+    _record_bot_message(chat_id)
 
     try:
         file = await doc.get_file()
         file_bytes_io = io.BytesIO()
         await file.download_to_memory(file_bytes_io)
         file_bytes = file_bytes_io.getvalue()
-        leader = analyzer.get_leader(team_name)
 
-        # Read file content as text for analysis
+        # === PDF: Driver orders sheet ===
+        if fname.endswith(".pdf"):
+            analysis = await analyzer.analyze_pdf_orders(file_bytes, team_name, fname)
+            if analysis:
+                await send_long_message(context, chat_id, analysis)
+                _record_bot_message(chat_id)
+            else:
+                await msg.reply_text(f"✅ استلمت الـ PDF يا {leader}. مش قادر أحلله دلوقتي.")
+                _record_bot_message(chat_id)
+            return
+
+        # === CSV / Excel ===
         file_content = ""
         if fname.endswith(".csv"):
             try:
