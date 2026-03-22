@@ -1214,7 +1214,7 @@ async def smart_daily_report(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_afternoon_questions(context: ContextTypes.DEFAULT_TYPE):
-    """4:00 PM - Send afternoon questions to each team."""
+    """4:00 PM - Send afternoon questions to each team + schedule follow-ups."""
     for gid, team_name in TEAMS.items():
         if gid in paused_teams:
             continue
@@ -1224,18 +1224,122 @@ async def send_afternoon_questions(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=gid,
                 text=(
                     f"مساء الخير يا {leader}! 🌤️\n"
-                    f"وقت تقرير الساعة 4:\n"
+                    f"وقت تقرير الساعة 4:\n\n"
                     f"1️⃣ أداء الإعلانات من الصبح لحد دلوقتي\n"
                     f"2️⃣ عدد الرسائل مقابل عدد الطلبات (فيسبوك)\n"
                     f"3️⃣ صرفتي كام على الفيسبوك؟\n"
                     f"4️⃣ عدد الليدز/المبيعات على التيك توك\n"
                     f"5️⃣ صرفتي كام على التيك توك؟\n"
                     f"6️⃣ وضع التوصيل النهاردة\n"
-                    f"7️⃣ أي ملاحظات أو مشاكل؟"
+                    f"7️⃣ أي ملاحظات أو مشاكل؟\n\n"
+                    f"ابعتيلي screenshots أو اكتبي الأرقام 🙏"
                 ),
             )
         except Exception as e:
             logger.error("Afternoon questions failed for %s: %s", team_name, e)
+        await asyncio.sleep(0.5)
+
+    # Schedule follow-up reminders every 15 minutes for 1.5 hours
+    jq = context.job_queue
+    for i, minutes in enumerate([15, 30, 45, 60, 75, 90], start=1):
+        jq.run_once(
+            _afternoon_followup,
+            when=timedelta(minutes=minutes),
+            name=f"afternoon_followup_{i}",
+            data={"step": i, "total": 6},
+        )
+    # Final check at 5:30 PM (90 min after 4:00)
+    jq.run_once(
+        final_afternoon_check,
+        when=timedelta(minutes=95),
+        name="final_afternoon_check",
+    )
+
+
+async def _afternoon_followup(context: ContextTypes.DEFAULT_TYPE):
+    """4:15-5:30 PM - Follow-up reminders for afternoon report."""
+    job_data = context.job.data or {}
+    step = job_data.get("step", 1)
+    total = job_data.get("total", 6)
+
+    prefixes = {
+        1: "⏰ تذكير (1):",
+        2: "⏰ تذكير (2):",
+        3: "⚠️ تذكير (3):",
+        4: "⚠️ تذكير (4):",
+        5: "🔴 تذكير (5):",
+        6: "🔴 تذكير أخير:",
+    }
+    prefix = prefixes.get(step, f"⏰ تذكير ({step}):")
+
+    for gid, team_name in TEAMS.items():
+        if gid in paused_teams:
+            continue
+        try:
+            # Check tracking sheet - did they send afternoon data?
+            tracking = await analyzer.get_team_tracking_today(team_name, "afternoon")
+            entries = tracking.get("data", []) if isinstance(tracking, dict) else []
+            if entries:
+                # Already sent something - skip reminder
+                continue
+
+            leader = analyzer.get_leader(team_name)
+            await context.bot.send_message(
+                chat_id=gid,
+                text=(
+                    f"{prefix}\n"
+                    f"يا {leader}، لسه مستني تقرير الساعة 4 🙏\n"
+                    f"ابعتيلي الأرقام أو screenshots"
+                ),
+            )
+        except Exception as e:
+            logger.error("Afternoon followup %d failed for %s: %s", step, team_name, e)
+        await asyncio.sleep(0.3)
+
+
+async def final_afternoon_check(context: ContextTypes.DEFAULT_TYPE):
+    """5:30 PM - Final afternoon check. Send reports to owner for decision."""
+    for team_name in analyzer.TEAM_INFO:
+        gid = TEAM_GIDS.get(team_name)
+        if not gid or gid in paused_teams:
+            continue
+
+        try:
+            # Check tracking sheet for afternoon entries
+            tracking = await analyzer.get_team_tracking_today(team_name, "afternoon")
+            entries = tracking.get("data", []) if isinstance(tracking, dict) else []
+            leader = analyzer.get_leader(team_name)
+
+            if entries:
+                # Team sent afternoon data - brief OK to owner
+                await context.bot.send_message(
+                    chat_id=OWNER_CHAT_ID,
+                    text=f"✅ {team_name} ({leader}): تقرير العصر وصل ({len(entries)} رد)",
+                )
+            else:
+                # Team didn't send - report to owner with decision buttons
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ تمام", callback_data=f"od_{gid}_ok"),
+                        InlineKeyboardButton("⚠️ خصم", callback_data=f"od_{gid}_deduct"),
+                    ],
+                    [
+                        InlineKeyboardButton("🔄 راجع تاني", callback_data=f"od_{gid}_recheck"),
+                        InlineKeyboardButton("💬 رسالة", callback_data=f"od_{gid}_msg"),
+                    ],
+                ]
+                await context.bot.send_message(
+                    chat_id=OWNER_CHAT_ID,
+                    text=(
+                        f"⚠️ {team_name} ({leader})\n"
+                        f"تقرير العصر: لم يصل ❌\n"
+                        f"مفيش أي رد من الساعة 4 لحد دلوقتي.\n\n"
+                        f"إيه القرار؟"
+                    ),
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+        except Exception as e:
+            logger.error("Final afternoon check failed for %s: %s", team_name, e)
         await asyncio.sleep(0.5)
 
 
