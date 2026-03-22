@@ -636,7 +636,7 @@ def _safe_num(val) -> float | None:
 
 
 def _parse_sheet_date(date_str: str):
-    """Parse date from team sheet (M/D/YYYY)."""
+    """Parse date from team sheet (M/D/YYYY). Returns timezone-aware datetime."""
     if not date_str:
         return None
     date_str = str(date_str).strip()
@@ -644,7 +644,7 @@ def _parse_sheet_date(date_str: str):
     if m:
         try:
             month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            return datetime(year, month, day)
+            return datetime(year, month, day, tzinfo=EGYPT_TZ)
         except ValueError:
             return None
     return None
