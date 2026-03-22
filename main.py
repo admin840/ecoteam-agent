@@ -1752,8 +1752,14 @@ async def send_smart_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
             logger.error("Morning reminder failed for %s: %s", team_name, e)
         await asyncio.sleep(0.5)
 
-    # Schedule follow-up reminders
+    # Cancel any existing morning followup jobs first (prevent duplicates)
     job_queue = context.job_queue
+    for job in job_queue.jobs():
+        if job.name and "followup_" in job.name:
+            job.schedule_removal()
+            logger.info("Removed old job: %s", job.name)
+
+    # Schedule follow-up reminders
     job_queue.run_once(_reminder_followup_1, when=timedelta(minutes=15),
                        name="followup_1")
     job_queue.run_once(_reminder_followup_2, when=timedelta(minutes=30),
@@ -1914,8 +1920,14 @@ async def send_afternoon_questions(context: ContextTypes.DEFAULT_TYPE):
             logger.error("Afternoon questions failed for %s: %s", team_name, e)
         await asyncio.sleep(0.5)
 
-    # Schedule follow-up reminders every 15 minutes for 1.5 hours
+    # Cancel any existing afternoon jobs first (prevent duplicates)
     jq = context.job_queue
+    for job in jq.jobs():
+        if job.name and ("afternoon_followup" in job.name or job.name == "final_afternoon_check"):
+            job.schedule_removal()
+            logger.info("Removed old job: %s", job.name)
+
+    # Schedule follow-up reminders every 15 minutes for 1.5 hours
     for i, minutes in enumerate([15, 30, 45, 60, 75, 90], start=1):
         jq.run_once(
             _afternoon_followup,
