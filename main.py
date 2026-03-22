@@ -421,7 +421,7 @@ async def _process_image(
 
     # Determine task_type based on time
     hour = now_egypt().hour
-    task_type = "morning" if hour < 14 else "evening"
+    task_type = "morning" if hour < 14 else "afternoon"
 
     # Log to tracking sheet
     ai_notes = json.dumps(

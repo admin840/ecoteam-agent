@@ -2035,7 +2035,7 @@ async def proactive_sheet_check() -> list[dict]:
             if not rows:
                 alerts.append({
                     "team": team_name, "leader": info["leader"],
-                    "type": "no_data", "severity": "warn",
+                    "type": "no_data", "severity": "warning",
                     "msg": f"مش قادر أقرأ شيت {team_name}"
                 })
                 continue
