@@ -92,6 +92,7 @@ IMAGE_TYPE_LABELS = {
     "fb_dash": ("📊 داشبورد فيسبوك", "fb_ads_dashboard", "Facebook"),
     "tt_dash": ("📊 داشبورد تيك توك", "tt_ads_dashboard", "TikTok"),
     "order_sheet": ("📋 شيت الطلبات", "order_sheet", ""),
+    "creative": ("🎨 كريتيف/منتج", "creative_image", ""),
     "other": ("📎 صورة تانية", "other", ""),
 }
 
@@ -184,6 +185,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("📋 شيت الطلبات", callback_data=f"it_{msg_id}_order_sheet"),
+            InlineKeyboardButton("🎨 كريتيف/منتج", callback_data=f"it_{msg_id}_creative"),
+        ],
+        [
             InlineKeyboardButton("📎 صورة تانية", callback_data=f"it_{msg_id}_other"),
         ],
     ]
@@ -248,12 +252,67 @@ async def callback_image_type(update: Update, context: ContextTypes.DEFAULT_TYPE
                              analyzer_type, platform, account_num=1, total_accounts=1)
         return
 
-    # For payment/dashboard types: ask how many accounts
+    # For creative: analyze as creative image
+    if img_type == "creative":
+        await query.edit_message_text(f"⏳ جاري تحليل الكريتيف...")
+        image_bytes = pending.get("image_bytes")
+        if not image_bytes:
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ مش لاقي الصورة.")
+            return
+        creative_analysis = await analyzer.analyze_image_creative(image_bytes, team_name)
+        if creative_analysis:
+            # Log to tracking
+            leader = analyzer.get_leader(team_name)
+            await analyzer.log_to_tracking(
+                team=team_name, leader=leader, image_type="creative_image",
+                platform="", account_num="1", amount="",
+                ai_notes="تحليل كريتيف", task_type="morning",
+                message_id=msg_id_str, status="✅",
+            )
+            await send_long_message(context, chat_id, creative_analysis)
+            # Interactive buttons after creative analysis
+            keyboard = [
+                [
+                    InlineKeyboardButton("ابعت للتيم ✅", callback_data=f"cr_{msg_id_str}_send"),
+                    InlineKeyboardButton("عدّل وابعت ✏️", callback_data=f"cr_{msg_id_str}_edit"),
+                    InlineKeyboardButton("سيبه 🤐", callback_data=f"cr_{msg_id_str}_skip"),
+                ],
+            ]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="من ناحية الكريتيف... عايز أبعت التقييم للتيم؟",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            analyzer.remember_exchange(team_name, creative_analysis[:300])
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ مش قادر أحلل الكريتيف.")
+        # Clean up
+        context.chat_data["pending_photos"].pop(msg_id_str, None)
+        return
+
+    # For payment/dashboard types: check if we already know the account count
     # Store selection in pending photo
     pending["img_type"] = img_type
     pending["analyzer_type"] = analyzer_type
     pending["platform"] = platform
     pending["label"] = label
+
+    # Auto-increment: if we already know total accounts for this type+platform
+    expected_key = f"{analyzer_type}_{platform}"
+    expected = context.chat_data.get("expected_accounts", {}).get(expected_key)
+    if expected:
+        total = expected["total"]
+        received = expected["received"]
+        next_account = received + 1
+        if next_account <= total:
+            pending["total_accounts"] = total
+            pending["current_account"] = next_account
+            await query.edit_message_text(
+                f"⏳ جاري تحليل {label} (حساب {next_account} من {total})..."
+            )
+            await _process_image(context, chat_id, team_name, msg_id_str,
+                                 analyzer_type, platform, next_account, total)
+            return
 
     keyboard = [
         [
@@ -413,6 +472,46 @@ async def _process_image(
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
+    # ── Multi-account tracking ──
+    # Count how many entries of this type+platform exist today for this team
+    if total_accounts > 1:
+        tracking_today = await analyzer.get_team_tracking_today(team_name, task_type)
+        same_type_count = sum(
+            1 for entry in tracking_today
+            if entry.get("image_type") == analyzer_type
+            and entry.get("platform") == platform
+        )
+        # Include the one we just logged
+        same_type_count = max(same_type_count, account_num)
+
+        if same_type_count < total_accounts:
+            remaining = list(range(same_type_count + 1, total_accounts + 1))
+            remaining_str = " و ".join(str(r) for r in remaining)
+            platform_label = "فيسبوك" if "fb" in analyzer_type else "تيك توك" if "tt" in analyzer_type else platform
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"تمام! ✅ حساب {same_type_count} من {total_accounts} ({platform_label}) وصل. لسه مستني حساب {remaining_str}",
+            )
+            # Store expected accounts info for auto-increment on next photo
+            if "expected_accounts" not in context.chat_data:
+                context.chat_data["expected_accounts"] = {}
+            context.chat_data["expected_accounts"][f"{analyzer_type}_{platform}"] = {
+                "total": total_accounts,
+                "received": same_type_count,
+                "img_type": pending.get("img_type", ""),
+            }
+        else:
+            platform_label = "فيسبوك" if "fb" in analyzer_type else "تيك توك" if "tt" in analyzer_type else platform
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"ممتاز! 🎉 كل حسابات {platform_label} ({total_accounts}/{total_accounts}) وصلت!",
+            )
+            # Clear expected accounts for this type
+            if "expected_accounts" in context.chat_data:
+                context.chat_data["expected_accounts"].pop(f"{analyzer_type}_{platform}", None)
+
+    # ── Analysis after logging ──
+
     # For payment images, also do a smart payment analysis
     if analyzer_type in analyzer.PAYMENT_IMAGE_TYPES:
         payment_analysis = await analyzer.handle_payment_image(
@@ -420,6 +519,20 @@ async def _process_image(
         )
         if payment_analysis:
             await send_long_message(context, chat_id, payment_analysis)
+            # Interactive follow-up buttons
+            keyboard = [
+                [
+                    InlineKeyboardButton("صح ✅", callback_data=f"ar_{msg_id_str}_ok"),
+                    InlineKeyboardButton("مش كده ❌", callback_data=f"ar_{msg_id_str}_wrong"),
+                    InlineKeyboardButton("تعليق 💬", callback_data=f"ar_{msg_id_str}_comment"),
+                ],
+            ]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="أنا شايف إن الأرقام كويسة... صح كده؟",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            analyzer.remember_exchange(team_name, payment_analysis[:300])
 
     # For dashboard/report images, do smart analysis
     elif analyzer_type in analyzer.REPORT_IMAGE_TYPES:
@@ -430,6 +543,35 @@ async def _process_image(
             await send_long_message(context, chat_id, analysis)
             # Store last analysis for correction flow
             context.chat_data["last_analysis"] = analysis
+
+            # Determine which interactive buttons to show based on analysis content
+            has_problem = any(w in analysis for w in ["عالي", "مرتفع", "مشكلة", "ناقص", "وحش"])
+            if has_problem:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("ابعت تنبيه للتيم", callback_data=f"ar_{msg_id_str}_alert"),
+                        InlineKeyboardButton("استنى شوية", callback_data=f"ar_{msg_id_str}_wait"),
+                        InlineKeyboardButton("حلل أكتر", callback_data=f"ar_{msg_id_str}_more"),
+                    ],
+                ]
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="عايز أعمل إيه؟",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            else:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("صح ✅", callback_data=f"ar_{msg_id_str}_ok"),
+                        InlineKeyboardButton("مش كده ❌", callback_data=f"ar_{msg_id_str}_wrong"),
+                        InlineKeyboardButton("تعليق 💬", callback_data=f"ar_{msg_id_str}_comment"),
+                    ],
+                ]
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="صح كده؟",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -723,13 +865,51 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await doc.get_file()
         file_bytes_io = io.BytesIO()
         await file.download_to_memory(file_bytes_io)
-        # For now, acknowledge receipt
+        file_bytes = file_bytes_io.getvalue()
         leader = analyzer.get_leader(team_name)
-        await msg.reply_text(
-            f"✅ استلمت الملف يا {leader}. هشتغل عليه."
-        )
+
+        # Read file content as text for analysis
+        file_content = ""
+        if fname.endswith(".csv"):
+            try:
+                file_content = file_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                try:
+                    file_content = file_bytes.decode("utf-8-sig")
+                except Exception:
+                    file_content = file_bytes.decode("latin-1", errors="replace")
+        elif fname.endswith((".xlsx", ".xls")):
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+                rows_text = []
+                ws = wb.active
+                for row in ws.iter_rows(max_row=100, values_only=True):
+                    row_str = "\t".join(str(c) if c is not None else "" for c in row)
+                    rows_text.append(row_str)
+                file_content = "\n".join(rows_text)
+                wb.close()
+            except ImportError:
+                # openpyxl not available - send raw bytes info
+                file_content = f"[Excel file: {len(file_bytes)} bytes, cannot parse without openpyxl]"
+            except Exception as e:
+                file_content = f"[Excel parse error: {e}]"
+
+        if file_content and len(file_content) > 50:
+            # Send to Claude for analysis
+            analysis = await analyzer.analyze_document(
+                file_content[:8000], team_name, fname
+            )
+            if analysis:
+                await send_long_message(context, chat_id, analysis)
+                analyzer.remember_exchange(team_name, analysis[:300])
+            else:
+                await msg.reply_text(f"✅ استلمت الملف يا {leader}. مش قادر أحلله دلوقتي.")
+        else:
+            await msg.reply_text(f"✅ استلمت الملف يا {leader}. الملف فاضي أو صغير.")
+
     except Exception as e:
-        logger.error("Document download error: %s", e)
+        logger.error("Document download/analysis error: %s", e)
         await msg.reply_text("⚠️ مش قادر أفتح الملف.")
 
 
@@ -768,6 +948,20 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if analysis:
             await send_long_message(context, chat_id, analysis)
+            # Interactive buttons after creative analysis
+            msg_id = msg.message_id
+            keyboard = [
+                [
+                    InlineKeyboardButton("ابعت للتيم ✅", callback_data=f"cr_{msg_id}_send"),
+                    InlineKeyboardButton("عدّل وابعت ✏️", callback_data=f"cr_{msg_id}_edit"),
+                    InlineKeyboardButton("سيبه 🤐", callback_data=f"cr_{msg_id}_skip"),
+                ],
+            ]
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="من ناحية الكريتيف... عايز أبعت التقييم للتيم؟",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
         else:
             await msg.reply_text("⚠️ مش قادر أحلل الفيديو.")
     except Exception as e:
@@ -1372,6 +1566,115 @@ async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# CALLBACK: Analysis reaction (ok / wrong / comment / alert / wait / more)
+# ══════════════════════════════════════════════════════════════════════
+
+async def callback_analysis_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user reaction to AI analysis."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # ar_{msg_id}_{action}
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        return
+    msg_id_str = parts[1]
+    action = parts[2]
+
+    chat_id = query.message.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+
+    last_analysis = context.chat_data.get("last_analysis", "")
+
+    if action == "ok":
+        await query.edit_message_text("تمام! ✅ شكراً على التأكيد.")
+        analyzer.remember_exchange(team_name, "تأكيد التحليل", user_reply="صح")
+
+    elif action == "wrong":
+        await query.edit_message_text("❌ إيه الغلط؟ اكتبلي وأنا هتعلم.")
+        context.chat_data["waiting_correction"] = {
+            "msg_id": msg_id_str,
+            "row_num": 0,
+            "team_name": team_name,
+        }
+        analyzer.remember_exchange(team_name, "تصحيح مطلوب", user_reply="مش كده")
+
+    elif action == "comment":
+        await query.edit_message_text("💬 اكتب التعليق...")
+        context.chat_data["waiting_comment"] = {
+            "msg_id": msg_id_str,
+            "row_num": 0,
+        }
+
+    elif action == "alert":
+        # Send alert to the team
+        leader = analyzer.get_leader(team_name)
+        alert_msg = f"⚠️ تنبيه يا {leader}:\nالأرقام محتاجة مراجعة. راجع/ي التحليل وبلغيني."
+        await context.bot.send_message(chat_id=chat_id, text=alert_msg)
+        await query.edit_message_text("✅ تم إرسال التنبيه للتيم.")
+        analyzer.remember_exchange(team_name, "تنبيه اتبعت للتيم", user_reply="ابعت تنبيه")
+
+    elif action == "wait":
+        await query.edit_message_text("تمام، هستنى شوية وهراجع تاني. ⏳")
+        analyzer.remember_exchange(team_name, "مستني", user_reply="استنى")
+
+    elif action == "more":
+        await query.edit_message_text("⏳ جاري تحليل أعمق...")
+        # Do deeper analysis using last analysis as context
+        if team_name:
+            deep_analysis = await analyzer.analyze_text_message(
+                team_name,
+                "عايز تحليل أعمق للأرقام - إيه المشكلة وإيه الحل؟",
+                last_analysis[:300],
+            )
+            if deep_analysis:
+                await send_long_message(context, chat_id, deep_analysis)
+                analyzer.remember_exchange(team_name, deep_analysis[:300], user_reply="حلل أكتر")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text="مش قادر أحلل أكتر دلوقتي.")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CALLBACK: Creative reaction (send / edit / skip)
+# ══════════════════════════════════════════════════════════════════════
+
+async def callback_creative_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user reaction to creative analysis."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # cr_{msg_id}_{action}
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        return
+    msg_id_str = parts[1]
+    action = parts[2]
+
+    chat_id = query.message.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+
+    if action == "send":
+        await query.edit_message_text("✅ تم! التقييم متبعت.")
+        analyzer.remember_exchange(team_name, "تقييم كريتيف اتبعت", user_reply="ابعت")
+
+    elif action == "edit":
+        await query.edit_message_text("✏️ اكتب التعديل وهبعته...")
+        context.chat_data["waiting_comment"] = {
+            "msg_id": msg_id_str,
+            "row_num": 0,
+        }
+        analyzer.remember_exchange(team_name, "تعديل تقييم كريتيف", user_reply="عدّل")
+
+    elif action == "skip":
+        await query.edit_message_text("تمام، مش هبعته. 🤐")
+        analyzer.remember_exchange(team_name, "تقييم كريتيف اتلغى", user_reply="سيبه")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # CALLBACK QUERY ROUTER
 # ══════════════════════════════════════════════════════════════════════
 
@@ -1395,6 +1698,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await callback_team_detail(update, context)
     elif data.startswith("ps_"):
         await callback_pause_toggle(update, context)
+    elif data.startswith("ar_"):
+        await callback_analysis_reaction(update, context)
+    elif data.startswith("cr_"):
+        await callback_creative_reaction(update, context)
     else:
         logger.warning("Unknown callback data: %s", data)
         await query.answer("⚠️")
