@@ -490,31 +490,53 @@ def db_get_missing_for_team(team_name, task_type="morning"):
 
         received_types = set()
         for entry in received:
-            received_types.add(entry.get("image_type", ""))
+            img_type = entry.get("image_type", "")
+            received_types.add(img_type)
+            # Normalize type names (buttons use short names)
+            if img_type in ("fb_pay", "fb_payment"):
+                received_types.add("fb_pay")
+                received_types.add("fb_payment")
+            elif img_type in ("tt_pay", "tt_payment"):
+                received_types.add("tt_pay")
+                received_types.add("tt_payment")
+            elif img_type in ("fb_dash", "fb_ads_dashboard"):
+                received_types.add("fb_dash")
+                received_types.add("fb_ads_dashboard")
+            elif img_type in ("tt_dash", "tt_ads_dashboard"):
+                received_types.add("tt_dash")
+                received_types.add("tt_ads_dashboard")
 
+        received_count = len(received)
         missing = []
         if task_type == "morning":
-            if "fb_ads_dashboard" not in received_types:
-                missing.append({"type": "fb_ads_dashboard", "label": "داشبورد فيسبوك"})
-            if "fb_payment" not in received_types:
-                missing.append({"type": "fb_payment", "label": "صفحة دفع فيسبوك"})
+            # 1. شيت التقرير
+            if "order_sheet" not in received_types:
+                missing.append({"type": "order_sheet", "label": "📋 شيت التقرير اليومي"})
+            # 2. دفع فيسبوك
+            if "fb_pay" not in received_types and "fb_payment" not in received_types:
+                missing.append({"type": "fb_pay", "label": "💳 صور دفع فيسبوك"})
+            # 3. دفع تيك توك (لو عنده حساب)
             has_tiktok = accounts.get("tiktok", 0) > 0
             if has_tiktok:
-                if "tt_ads_dashboard" not in received_types:
-                    missing.append({"type": "tt_ads_dashboard", "label": "داشبورد تيك توك"})
-                if "tt_payment" not in received_types:
-                    missing.append({"type": "tt_payment", "label": "صفحة دفع تيك توك"})
-            if "order_sheet" not in received_types:
-                missing.append({"type": "order_sheet", "label": "شيت الطلبات"})
-        elif task_type == "evening":
-            if "order_sheet" not in received_types:
-                missing.append({"type": "order_sheet", "label": "شيت الطلبات (مسائي)"})
+                if "tt_pay" not in received_types and "tt_payment" not in received_types:
+                    missing.append({"type": "tt_pay", "label": "💳 صور دفع تيك توك"})
+            # 4. داشبورد
+            if "fb_dash" not in received_types and "fb_ads_dashboard" not in received_types:
+                missing.append({"type": "fb_dash", "label": "📊 داشبورد الإعلانات"})
+            # 5. PDF سواقين
+            if "driver_orders_pdf" not in received_types:
+                missing.append({"type": "driver_orders_pdf", "label": "📄 شيت طلبات السواقين PDF"})
+
+        elif task_type in ("afternoon", "evening"):
+            if not received:
+                missing.append({"type": "afternoon_report", "label": "📊 تقرير العصر"})
 
         return {
             "missing": missing,
             "received": received,
             "received_types": list(received_types),
             "complete": len(missing) == 0,
+            "received_count": received_count,
             "accounts": accounts,
         }
     except Exception as e:

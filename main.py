@@ -15,6 +15,8 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -130,6 +132,20 @@ def is_owner(user_id: int) -> bool:
 
 def is_team_group(chat_id: int) -> bool:
     return chat_id in TEAMS
+
+
+def _get_persistent_keyboard() -> ReplyKeyboardMarkup:
+    """Return context-appropriate persistent keyboard."""
+    hour = now_egypt().hour
+
+    if hour < 12:  # Morning task time
+        buttons = [[KeyboardButton("📋 تاسك الصبح"), KeyboardButton("🤖 مساعدة")]]
+    elif hour < 16:  # Free time
+        buttons = [[KeyboardButton("🤖 مساعدة")]]
+    else:  # Afternoon task time
+        buttons = [[KeyboardButton("📋 تاسك العصر"), KeyboardButton("🤖 مساعدة")]]
+
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=False)
 
 
 async def send_long_message(context, chat_id: int, text: str, **kwargs):
@@ -827,6 +843,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in paused_teams:
         return
 
+    # Handle persistent keyboard buttons
+    if text == "📋 تاسك الصبح":
+        await _show_morning_checklist(update, context, team_name)
+        return
+    elif text == "📋 تاسك العصر":
+        await _show_afternoon_checklist(update, context, team_name)
+        return
+    elif text == "🤖 مساعدة":
+        await _show_help_menu(update, context, team_name)
+        return
+
     # Owner silence mode in groups
     if is_owner(user_id) and not text.startswith("/"):
         # Owner sends text in group - bot stays silent
@@ -1058,6 +1085,180 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("Video analysis error: %s", e)
         await msg.reply_text("⚠️ حصل مشكلة في تحليل الفيديو.")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# INTERACTIVE MENU & CHECKLIST
+# ══════════════════════════════════════════════════════════════════════
+
+async def _show_morning_checklist(update, context, team_name):
+    """Show live checklist of morning task items."""
+    leader = analyzer.get_leader(team_name)
+    chat_id = update.message.chat_id
+    today = now_egypt().strftime("%d/%m/%Y")
+
+    # Get what's been received today from DB
+    entries = analyzer.db_get_tracking_today(team_name, "morning")
+
+    # Determine what's received
+    has_sheet = any(e.get("image_type") in ("order_sheet",) for e in entries)
+    has_dashboard = any(e.get("image_type") in ("fb_dash", "tt_dash", "fb_ads_dashboard", "tt_ads_dashboard") for e in entries)
+    has_pdf = any(e.get("image_type") in ("driver_orders_pdf",) for e in entries)
+
+    # Count payment images by platform
+    fb_payments = [e for e in entries if e.get("image_type") in ("fb_pay", "fb_payment")]
+    tt_payments = [e for e in entries if e.get("image_type") in ("tt_pay", "tt_payment")]
+
+    # Get expected account counts from DB
+    accounts = analyzer.db_get_team_accounts(team_name)
+    fb_expected = accounts.get("facebook", 1) if accounts else 1
+    tt_expected = accounts.get("tiktok", 0) if accounts else 0
+
+    # Build checklist
+    sheet_icon = "✅" if has_sheet else "⬜"
+    dash_icon = "✅" if has_dashboard else "⬜"
+    pdf_icon = "✅" if has_pdf else "⬜"
+
+    fb_icon = "✅" if len(fb_payments) >= fb_expected else f"⏳ ({len(fb_payments)}/{fb_expected})" if fb_payments else "⬜"
+
+    lines = [
+        f"📋 تاسك الصبح - {today}\n",
+        f"1️⃣ شيت التقرير اليومي {sheet_icon}",
+        f"2️⃣ صور الدفع فيسبوك {fb_icon}",
+    ]
+
+    if tt_expected > 0:
+        tt_icon = "✅" if len(tt_payments) >= tt_expected else f"⏳ ({len(tt_payments)}/{tt_expected})" if tt_payments else "⬜"
+        lines.append(f"3️⃣ صور الدفع تيك توك {tt_icon}")
+
+    lines.extend([
+        f"{'4' if tt_expected > 0 else '3'}️⃣ داشبورد الإعلانات {dash_icon}",
+        f"{'5' if tt_expected > 0 else '4'}️⃣ شيت طلبات السواقين PDF {pdf_icon}",
+    ])
+
+    # Count completed
+    total_items = 3 + (1 if tt_expected > 0 else 0) + 1  # sheet + fb + (tt) + dash + pdf
+    completed = sum([has_sheet, len(fb_payments) >= fb_expected, has_dashboard, has_pdf])
+    if tt_expected > 0:
+        completed += 1 if len(tt_payments) >= tt_expected else 0
+
+    if completed >= total_items:
+        lines.append(f"\n🎉 ممتاز يا {leader}! كل حاجة وصلت!")
+    else:
+        remaining = total_items - completed
+        lines.append(f"\nلسه {remaining} حاجات. ابعتيلي واحدة واحدة 🙏")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=_get_persistent_keyboard(),
+    )
+    _record_bot_message(chat_id)
+
+
+async def _show_afternoon_checklist(update, context, team_name):
+    """Show afternoon task requirements."""
+    leader = analyzer.get_leader(team_name)
+    chat_id = update.message.chat_id
+
+    # Check if afternoon data was sent
+    entries = analyzer.db_get_tracking_today(team_name, "afternoon")
+
+    status = "✅ وصل" if entries else "⬜ لسه"
+
+    text = (
+        f"📋 تاسك العصر - {now_egypt().strftime('%d/%m/%Y')}\n\n"
+        f"المطلوب: {status}\n\n"
+        f"1️⃣ أداء الإعلانات من الصبح لحد دلوقتي\n"
+        f"2️⃣ عدد الرسائل مقابل عدد الطلبات (فيسبوك)\n"
+        f"3️⃣ صرفتي كام على الفيسبوك؟\n"
+        f"4️⃣ عدد الليدز/المبيعات على التيك توك\n"
+        f"5️⃣ صرفتي كام على التيك توك؟\n"
+        f"6️⃣ وضع التوصيل النهاردة\n"
+        f"7️⃣ أي ملاحظات أو مشاكل؟\n\n"
+        f"ابعتيلي screenshots أو اكتبي الأرقام 🙏"
+    )
+
+    await update.message.reply_text(text, reply_markup=_get_persistent_keyboard())
+    _record_bot_message(chat_id)
+
+
+async def _show_help_menu(update, context, team_name):
+    """Show bot capabilities as inline buttons."""
+    leader = analyzer.get_leader(team_name)
+    chat_id = update.message.chat_id
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 حلل أرقامي", callback_data="help_analyze"),
+            InlineKeyboardButton("📈 أداء الأسبوع", callback_data="help_weekly"),
+        ],
+        [
+            InlineKeyboardButton("🎨 حلل كريتيف", callback_data="help_creative"),
+            InlineKeyboardButton("✍️ اكتبلي إعلان", callback_data="help_adcopy"),
+        ],
+        [
+            InlineKeyboardButton("📋 راجع شيت/ملف", callback_data="help_sheet"),
+            InlineKeyboardButton("💡 اقتراحات تحسين", callback_data="help_suggest"),
+        ],
+        [
+            InlineKeyboardButton("❓ سؤال تاني", callback_data="help_question"),
+        ],
+    ]
+
+    await update.message.reply_text(
+        f"🤖 أهلاً يا {leader}! إزاي أقدر أساعدك؟",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    _record_bot_message(chat_id)
+
+
+async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle help menu button clicks."""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+    leader = analyzer.get_leader(team_name)
+
+    action = query.data.replace("help_", "")
+
+    prompts = {
+        "analyze": f"يا {leader}، ابعتيلي screenshot أو اكتبيلي الأرقام (spend, orders) وأنا هحللهم.",
+        "weekly": f"يا {leader}، خليني أشوف أداء الأسبوع... ثانية واحدة 📊",
+        "creative": f"يا {leader}، ابعتيلي صورة أو فيديو الإعلان وأنا هقيّمه وأقولك رأيي 🎨",
+        "adcopy": f"يا {leader}، قوليلي اسم المنتج ووصفه وأنا هكتبلك 3 نسخ إعلانية ✍️",
+        "sheet": f"يا {leader}، ابعتيلي الملف (CSV أو Excel أو PDF) وأنا هحلله 📋",
+        "suggest": f"يا {leader}، خليني أشوف بياناتك وأقولك اقتراحات... ثانية 💡",
+        "question": f"يا {leader}، اسألي أي سؤال عن الإعلانات أو الأداء وأنا هجاوبك 😊",
+    }
+
+    response_text = prompts.get(action, f"يا {leader}، قوليلي محتاجة إيه وأنا هساعدك!")
+
+    # For weekly and suggest, actually fetch and analyze
+    if action == "weekly":
+        perf = analyzer.db_get_daily_performance(team_name, days=7)
+        if perf:
+            analysis = await analyzer.analyze_text_message(
+                team_name,
+                "حلل أداء الأسبوع ده وقولي رأيك واقتراحاتك",
+                ""
+            )
+            if analysis:
+                response_text = analysis
+    elif action == "suggest":
+        analysis = await analyzer.analyze_text_message(
+            team_name,
+            "بناءً على كل البيانات عندك، إيه اقتراحاتك لتحسين الأداء؟",
+            ""
+        )
+        if analysis:
+            response_text = analysis
+
+    await query.edit_message_text(response_text)
+    _record_bot_message(chat_id)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1355,19 +1556,27 @@ async def callback_pause_toggle(update: Update, context: ContextTypes.DEFAULT_TY
 # ══════════════════════════════════════════════════════════════════════
 
 async def send_morning_prereminder(context: ContextTypes.DEFAULT_TYPE):
-    """10:30 AM - Friendly morning reminder."""
+    """10:30 AM - Friendly morning reminder. Skip teams that already submitted."""
     for gid, team_name in TEAMS.items():
         if gid in paused_teams:
             continue
         leader = analyzer.get_leader(team_name)
         try:
+            # CHECK DB FIRST - skip if team already submitted
+            entries = analyzer.db_get_tracking_today(team_name, "morning")
+            if entries and len(entries) >= 2:
+                # Already sent 2+ items, skip reminder
+                continue
+
             await context.bot.send_message(
                 chat_id=gid,
                 text=(
                     f"صباح الخير يا {leader}! ☀️\n"
                     f"فاكرين تقرير الصبح؟\n"
+                    f"المطلوب: شيت + صور دفع + داشبورد + PDF سواقين\n"
                     f"الديدلاين الساعة 11:00 ⏰"
                 ),
+                reply_markup=_get_persistent_keyboard(),
             )
             _record_bot_message(gid)
         except Exception as e:
@@ -1376,24 +1585,36 @@ async def send_morning_prereminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_smart_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """11:00 AM - Deadline reached. Start tracking. Schedule follow-ups."""
+    """11:00 AM - Deadline reached. Only remind teams with MISSING items."""
     for gid, team_name in TEAMS.items():
         if gid in paused_teams:
             continue
         leader = analyzer.get_leader(team_name)
         try:
+            # CHECK DB FIRST - what's missing?
             missing = await analyzer.get_missing_for_team(team_name, "morning")
-            if not missing["complete"]:
-                missing_labels = [m["label"] for m in missing["missing"]]
+            if missing["complete"]:
+                # Team is done! Send thank you instead
                 await context.bot.send_message(
                     chat_id=gid,
-                    text=(
-                        f"⏰ يا {leader}، الساعة 11 والمطلوب:\n"
-                        + "\n".join(f"  - {ml}" for ml in missing_labels)
-                        + "\n\nابعتيهم دلوقتي لو سمحتي 🙏"
-                    ),
+                    text=f"✅ شكراً يا {leader}! تقرير الصبح كامل. شغل ممتاز! 💪",
                 )
                 _record_bot_message(gid)
+                continue
+
+            missing_labels = [m["label"] for m in missing["missing"]]
+            received = missing.get("received_count", 0)
+            await context.bot.send_message(
+                chat_id=gid,
+                text=(
+                    f"⏰ يا {leader}، الساعة 11.\n"
+                    f"وصلني {received} حاجة ✅ بس لسه ناقص:\n"
+                    + "\n".join(f"  ⬜ {ml}" for ml in missing_labels)
+                    + "\n\nابعتيهم دلوقتي لو سمحتي 🙏"
+                ),
+                reply_markup=_get_persistent_keyboard(),
+            )
+            _record_bot_message(gid)
         except Exception as e:
             logger.error("Morning reminder failed for %s: %s", team_name, e)
         await asyncio.sleep(0.5)
@@ -1809,6 +2030,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await callback_analysis_reaction(update, context)
     elif data.startswith("cr_"):
         await callback_creative_reaction(update, context)
+    elif data.startswith("help_"):
+        await callback_help(update, context)
     else:
         logger.warning("Unknown callback data: %s", data)
         await query.answer("⚠️")
