@@ -20,6 +20,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -28,6 +29,17 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+
+
+async def safe_edit_message(query, text, reply_markup=None, parse_mode=None):
+    """Edit message safely - ignore 'message not modified' errors."""
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except BadRequest as e:
+        if "message is not modified" in str(e).lower():
+            pass  # Same content, ignore
+        else:
+            raise
 
 import analyzer
 
@@ -301,19 +313,19 @@ async def callback_image_type(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Retrieve pending photo
     pending = context.chat_data.get("pending_photos", {}).get(msg_id_str)
     if not pending:
-        await query.edit_message_text("⚠️ الصورة دي قديمة، ابعتها تاني.")
+        await safe_edit_message(query,"⚠️ الصورة دي قديمة، ابعتها تاني.")
         return
 
     type_info = IMAGE_TYPE_LABELS.get(img_type)
     if not type_info:
-        await query.edit_message_text("⚠️ نوع مش معروف.")
+        await safe_edit_message(query,"⚠️ نوع مش معروف.")
         return
 
     label, analyzer_type, platform = type_info
 
     # For "other" type: just acknowledge
     if img_type == "other":
-        await query.edit_message_text(f"✅ تمام، سجلت الصورة كـ {label}")
+        await safe_edit_message(query,f"✅ تمام، سجلت الصورة كـ {label}")
         # Log to tracking
         leader = analyzer.get_leader(team_name)
         await analyzer.log_to_tracking(
@@ -328,14 +340,14 @@ async def callback_image_type(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # For order_sheet: no account count needed, go straight to processing
     if img_type == "order_sheet":
-        await query.edit_message_text(f"⏳ جاري تحليل {label}...")
+        await safe_edit_message(query,f"⏳ جاري تحليل {label}...")
         await _process_image(context, chat_id, team_name, msg_id_str,
                              analyzer_type, platform, account_num=1, total_accounts=1)
         return
 
     # For creative: analyze as creative image
     if img_type == "creative":
-        await query.edit_message_text(f"⏳ جاري تحليل الكريتيف...")
+        await safe_edit_message(query,f"⏳ جاري تحليل الكريتيف...")
         image_bytes = pending.get("image_bytes")
         if not image_bytes:
             await context.bot.send_message(chat_id=chat_id, text="⚠️ مش لاقي الصورة.")
@@ -391,7 +403,7 @@ async def callback_image_type(update: Update, context: ContextTypes.DEFAULT_TYPE
         if next_account <= total:
             pending["total_accounts"] = total
             pending["current_account"] = next_account
-            await query.edit_message_text(
+            await safe_edit_message(query,
                 f"⏳ جاري تحليل {label} (حساب {next_account} من {total})..."
             )
             await _process_image(context, chat_id, team_name, msg_id_str,
@@ -407,7 +419,7 @@ async def callback_image_type(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton("5", callback_data=f"ac_{msg_id_str}_5"),
         ],
     ]
-    await query.edit_message_text(
+    await safe_edit_message(query,
         f"كام حساب عندك على {platform}؟",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -436,7 +448,7 @@ async def callback_account_count(update: Update, context: ContextTypes.DEFAULT_T
 
     pending = context.chat_data.get("pending_photos", {}).get(msg_id_str)
     if not pending:
-        await query.edit_message_text("⚠️ الصورة دي قديمة، ابعتها تاني.")
+        await safe_edit_message(query,"⚠️ الصورة دي قديمة، ابعتها تاني.")
         return
 
     analyzer_type = pending.get("analyzer_type", "other")
@@ -449,7 +461,7 @@ async def callback_account_count(update: Update, context: ContextTypes.DEFAULT_T
     # Track which account number this is (first photo = account 1)
     current_account = pending.get("current_account", 1)
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         f"⏳ جاري تحليل {label} (حساب {current_account} من {count})..."
     )
     await _process_image(context, chat_id, team_name, msg_id_str,
@@ -702,14 +714,14 @@ async def callback_confirmation(update: Update, context: ContextTypes.DEFAULT_TY
         # Confirmed - update status
         if row_num:
             await analyzer.update_tracking_status(row_num, "✅")
-        await query.edit_message_text(query.message.text + "\n\n✅ تم التأكيد!")
+        await safe_edit_message(query,query.message.text + "\n\n✅ تم التأكيد!")
         # Clean up
         if pending:
             context.chat_data["pending_photos"].pop(msg_id_str, None)
 
     elif action == "wrong":
         # User says extraction is wrong
-        await query.edit_message_text(
+        await safe_edit_message(query,
             query.message.text + "\n\n❌ إيه الغلط؟ ابعت الرقم الصح وهتعلم منك."
         )
         # Set waiting_correction state
@@ -721,7 +733,7 @@ async def callback_confirmation(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif action == "comment":
         # User wants to add a comment
-        await query.edit_message_text(
+        await safe_edit_message(query,
             query.message.text + "\n\n💬 اكتب التعليق..."
         )
         context.chat_data["waiting_comment"] = {
@@ -751,7 +763,7 @@ async def callback_owner_decision(update: Update, context: ContextTypes.DEFAULT_
     leader = analyzer.get_leader(team_name)
 
     if action == "ok":
-        await query.edit_message_text(
+        await safe_edit_message(query,
             query.message.text + f"\n\n✅ تمام - {team_name} مفيش خصم."
         )
 
@@ -765,17 +777,17 @@ async def callback_owner_decision(update: Update, context: ContextTypes.DEFAULT_
         try:
             await context.bot.send_message(chat_id=team_gid, text=deduct_msg)
             _record_bot_message(team_gid)
-            await query.edit_message_text(
+            await safe_edit_message(query,
                 query.message.text + f"\n\n⚠️ تم إرسال إنذار خصم لـ {team_name}."
             )
         except Exception as e:
             logger.error("Failed to send deduction to %s: %s", team_name, e)
-            await query.edit_message_text(
+            await safe_edit_message(query,
                 query.message.text + f"\n\n❌ فشل الإرسال: {e}"
             )
 
     elif action == "recheck":
-        await query.edit_message_text(
+        await safe_edit_message(query,
             query.message.text + "\n\n🔄 جاري المراجعة تاني..."
         )
         # Re-check and send updated report
@@ -790,7 +802,7 @@ async def callback_owner_decision(update: Update, context: ContextTypes.DEFAULT_
 
     elif action == "msg":
         # Ask owner what message to send
-        await query.edit_message_text(
+        await safe_edit_message(query,
             query.message.text + "\n\n💬 اكتب الرسالة اللي عايز تبعتها..."
         )
         context.bot_data["owner_msg_target"] = team_gid
@@ -1303,7 +1315,7 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if analysis:
             response_text = analysis
 
-    await query.edit_message_text(response_text)
+    await safe_edit_message(query,response_text)
     _record_bot_message(chat_id)
 
 
@@ -1490,10 +1502,10 @@ async def callback_team_detail(update: Update, context: ContextTypes.DEFAULT_TYP
             team_name = tn
             break
     if not team_name:
-        await query.edit_message_text("⚠️ مش لاقي الفريق.")
+        await safe_edit_message(query,"⚠️ مش لاقي الفريق.")
         return
 
-    await query.edit_message_text(f"⏳ جاري تحميل بيانات {team_name}...")
+    await safe_edit_message(query,f"⏳ جاري تحميل بيانات {team_name}...")
 
     ctx = await analyzer.build_team_context(team_name)
     text = analyzer.format_context_for_prompt(ctx)
@@ -1503,7 +1515,7 @@ async def callback_team_detail(update: Update, context: ContextTypes.DEFAULT_TYP
         text = text[:3900] + "\n\n... (مقطوع)"
 
     try:
-        await query.edit_message_text(text)
+        await safe_edit_message(query,text)
     except Exception:
         await send_long_message(context, query.message.chat_id, text)
 
@@ -1640,11 +1652,11 @@ async def callback_pause_toggle(update: Update, context: ContextTypes.DEFAULT_TY
     if gid in paused_teams:
         paused_teams.discard(gid)
         _save_paused()
-        await query.edit_message_text(f"▶️ تم تشغيل {team_name}")
+        await safe_edit_message(query,f"▶️ تم تشغيل {team_name}")
     else:
         paused_teams.add(gid)
         _save_paused()
-        await query.edit_message_text(f"⏸️ تم إيقاف {team_name}")
+        await safe_edit_message(query,f"⏸️ تم إيقاف {team_name}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2010,11 +2022,11 @@ async def callback_analysis_reaction(update: Update, context: ContextTypes.DEFAU
     last_analysis = context.chat_data.get("last_analysis", "")
 
     if action == "ok":
-        await query.edit_message_text("تمام! ✅ شكراً على التأكيد.")
+        await safe_edit_message(query,"تمام! ✅ شكراً على التأكيد.")
         analyzer.remember_exchange(team_name, "تأكيد التحليل", user_reply="صح")
 
     elif action == "wrong":
-        await query.edit_message_text("❌ إيه الغلط؟ اكتبلي وأنا هتعلم.")
+        await safe_edit_message(query,"❌ إيه الغلط؟ اكتبلي وأنا هتعلم.")
         context.chat_data["waiting_correction"] = {
             "msg_id": msg_id_str,
             "row_num": 0,
@@ -2023,7 +2035,7 @@ async def callback_analysis_reaction(update: Update, context: ContextTypes.DEFAU
         analyzer.remember_exchange(team_name, "تصحيح مطلوب", user_reply="مش كده")
 
     elif action == "comment":
-        await query.edit_message_text("💬 اكتب التعليق...")
+        await safe_edit_message(query,"💬 اكتب التعليق...")
         context.chat_data["waiting_comment"] = {
             "msg_id": msg_id_str,
             "row_num": 0,
@@ -2035,15 +2047,15 @@ async def callback_analysis_reaction(update: Update, context: ContextTypes.DEFAU
         alert_msg = f"⚠️ تنبيه يا {leader}:\nالأرقام محتاجة مراجعة. راجع/ي التحليل وبلغيني."
         await context.bot.send_message(chat_id=chat_id, text=alert_msg)
         _record_bot_message(chat_id)
-        await query.edit_message_text("✅ تم إرسال التنبيه للتيم.")
+        await safe_edit_message(query,"✅ تم إرسال التنبيه للتيم.")
         analyzer.remember_exchange(team_name, "تنبيه اتبعت للتيم", user_reply="ابعت تنبيه")
 
     elif action == "wait":
-        await query.edit_message_text("تمام، هستنى شوية وهراجع تاني. ⏳")
+        await safe_edit_message(query,"تمام، هستنى شوية وهراجع تاني. ⏳")
         analyzer.remember_exchange(team_name, "مستني", user_reply="استنى")
 
     elif action == "more":
-        await query.edit_message_text("⏳ جاري تحليل أعمق...")
+        await safe_edit_message(query,"⏳ جاري تحليل أعمق...")
         # Do deeper analysis using last analysis as context
         if team_name:
             deep_analysis = await analyzer.analyze_text_message(
@@ -2082,11 +2094,11 @@ async def callback_creative_reaction(update: Update, context: ContextTypes.DEFAU
         return
 
     if action == "send":
-        await query.edit_message_text("✅ تم! التقييم متبعت.")
+        await safe_edit_message(query,"✅ تم! التقييم متبعت.")
         analyzer.remember_exchange(team_name, "تقييم كريتيف اتبعت", user_reply="ابعت")
 
     elif action == "edit":
-        await query.edit_message_text("✏️ اكتب التعديل وهبعته...")
+        await safe_edit_message(query,"✏️ اكتب التعديل وهبعته...")
         context.chat_data["waiting_comment"] = {
             "msg_id": msg_id_str,
             "row_num": 0,
@@ -2094,7 +2106,7 @@ async def callback_creative_reaction(update: Update, context: ContextTypes.DEFAU
         analyzer.remember_exchange(team_name, "تعديل تقييم كريتيف", user_reply="عدّل")
 
     elif action == "skip":
-        await query.edit_message_text("تمام، مش هبعته. 🤐")
+        await safe_edit_message(query,"تمام، مش هبعته. 🤐")
         analyzer.remember_exchange(team_name, "تقييم كريتيف اتلغى", user_reply="سيبه")
 
 

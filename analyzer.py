@@ -2956,7 +2956,9 @@ async def generate_smart_daily_report() -> str:
     total_delivered = 0
 
     for t in sorted(all_teams_data, key=lambda x: x.get("cpo") or 999):
-        data_text += f"- {t['team']} ({t['leader']}): Spend={t['spend']:,.0f} | Orders={t['orders']:.0f} | CPO={t['cpo']:.0f if t['cpo'] else '?'} | CPA={t['cpa'] if t['cpa'] else '?'}\n"
+        cpo_str = f"{t['cpo']:.0f}" if t.get('cpo') else "?"
+        cpa_str = f"{t['cpa']:.0f}" if t.get('cpa') else "?"
+        data_text += f"- {t['team']} ({t['leader']}): Spend={t['spend']:,.0f} | Orders={t['orders']:.0f} | CPO={cpo_str} | CPA={cpa_str}\n"
         total_spend += t.get("spend") or 0
         total_orders += t.get("orders") or 0
         total_delivered += t.get("delivered") or 0
