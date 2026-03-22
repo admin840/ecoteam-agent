@@ -358,7 +358,7 @@ async def log_to_tracking(
             "task_type": task_type,
             "message_id": message_id,
             "status": status,
-            "date": _now_egypt().strftime("%Y-%m-%d"),
+            "date": _now_egypt().strftime("%d/%m/%Y"),
             "time": _now_egypt().strftime("%H:%M"),
         }
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -382,13 +382,13 @@ async def get_team_tracking_today(team_name: str, task_type: str = "morning") ->
             "action": "read",
             "team": team_name,
             "task_type": task_type,
-            "date": _now_egypt().strftime("%Y-%m-%d"),
+            "date": _now_egypt().strftime("%d/%m/%Y"),
         }
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(TRACKING_SHEET_URL, params=params)
             data = resp.json()
             if data.get("success"):
-                return data.get("entries", [])
+                return data.get("data", [])
     except Exception as e:
         logger.error("Tracking read error for %s: %s", team_name, e)
     return []

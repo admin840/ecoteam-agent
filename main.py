@@ -63,7 +63,27 @@ TEAMS: dict[int, str] = {
 TEAM_GIDS: dict[str, int] = {v: k for k, v in TEAMS.items()}
 
 # Paused teams (group ids)
-paused_teams: set[int] = set()
+DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
+_PAUSED_FILE = os.path.join(DATA_DIR, "paused_teams.json")
+
+
+def _load_paused() -> set[int]:
+    try:
+        with open(_PAUSED_FILE, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def _save_paused():
+    try:
+        with open(_PAUSED_FILE, "w") as f:
+            json.dump(list(paused_teams), f)
+    except Exception:
+        pass
+
+
+paused_teams: set[int] = _load_paused()
 
 # ── Image type labels ────────────────────────────────────────────────
 IMAGE_TYPE_LABELS = {
@@ -990,9 +1010,11 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id in TEAMS:
         if chat_id in paused_teams:
             paused_teams.discard(chat_id)
+            _save_paused()
             await update.message.reply_text(f"▶️ تم تشغيل {TEAMS[chat_id]}")
         else:
             paused_teams.add(chat_id)
+            _save_paused()
             await update.message.reply_text(f"⏸️ تم إيقاف {TEAMS[chat_id]}")
         return
 
@@ -1027,9 +1049,11 @@ async def callback_pause_toggle(update: Update, context: ContextTypes.DEFAULT_TY
 
     if gid in paused_teams:
         paused_teams.discard(gid)
+        _save_paused()
         await query.edit_message_text(f"▶️ تم تشغيل {team_name}")
     else:
         paused_teams.add(gid)
+        _save_paused()
         await query.edit_message_text(f"⏸️ تم إيقاف {team_name}")
 
 
@@ -1277,8 +1301,7 @@ async def _afternoon_followup(context: ContextTypes.DEFAULT_TYPE):
             continue
         try:
             # Check tracking sheet - did they send afternoon data?
-            tracking = await analyzer.get_team_tracking_today(team_name, "afternoon")
-            entries = tracking.get("data", []) if isinstance(tracking, dict) else []
+            entries = await analyzer.get_team_tracking_today(team_name, "afternoon")
             if entries:
                 # Already sent something - skip reminder
                 continue
@@ -1306,8 +1329,7 @@ async def final_afternoon_check(context: ContextTypes.DEFAULT_TYPE):
 
         try:
             # Check tracking sheet for afternoon entries
-            tracking = await analyzer.get_team_tracking_today(team_name, "afternoon")
-            entries = tracking.get("data", []) if isinstance(tracking, dict) else []
+            entries = await analyzer.get_team_tracking_today(team_name, "afternoon")
             leader = analyzer.get_leader(team_name)
 
             if entries:
