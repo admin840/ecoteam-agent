@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import io as _io
 import urllib.parse
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -47,6 +48,9 @@ TRACKING_SHEET_ID = "1aKF2b3oRSkdvpybmmE_j1U34DVn6mpJSyjPp5btnBvg"
 
 # Persistent storage: /data on Railway, fallback to cwd
 DATA_DIR = Path("/data") if Path("/data").exists() else Path(".")
+
+# SQLite database path
+DB_PATH = os.path.join(os.environ.get("DATA_DIR", str(DATA_DIR)), "ecoteam.db")
 
 
 # ── Team info (EXACT - do not change) ─────────────────────────────────
@@ -92,6 +96,430 @@ TEAM_SHEET_COLUMNS = [
     "Delivered", "Cancel", "Hold", "CPO",
     "Daily Target", "Gap", "Lamp", "Del%", "Cancel%", "Hold%",
 ]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SQLITE DATABASE LAYER
+# ══════════════════════════════════════════════════════════════════════
+
+def _get_db():
+    """Get SQLite connection with row factory."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    """Create all tables if they don't exist."""
+    try:
+        conn = _get_db()
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS tracking (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            time TEXT,
+            team TEXT,
+            leader TEXT,
+            image_type TEXT,
+            platform TEXT,
+            account_num TEXT,
+            amount TEXT,
+            ai_notes TEXT,
+            leader_comment TEXT,
+            status TEXT,
+            task_type TEXT,
+            message_id TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            team TEXT,
+            leader TEXT,
+            bot_message TEXT,
+            user_reply TEXT,
+            context TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            team TEXT,
+            leader TEXT,
+            decision TEXT,
+            reason TEXT,
+            owner_note TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS team_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team TEXT,
+            platform TEXT,
+            account_count INTEGER,
+            updated_at TEXT,
+            UNIQUE(team, platform)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS learnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            team TEXT,
+            category TEXT,
+            original TEXT,
+            correction TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_performance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            team TEXT,
+            spend REAL,
+            new_orders REAL,
+            delivered REAL,
+            cancel REAL,
+            hold REAL,
+            cpo REAL,
+            cpa REAL,
+            cancel_rate REAL,
+            source TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(date, team)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS creative_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            team TEXT,
+            creative_type TEXT,
+            score TEXT,
+            analysis TEXT,
+            performance_impact TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS budget_tracking (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            team TEXT,
+            platform TEXT,
+            payment_method TEXT,
+            amount REAL,
+            currency TEXT DEFAULT 'EGP',
+            source TEXT,
+            notes TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )""")
+        conn.commit()
+        conn.close()
+        logger.info("SQLite DB initialized at %s", DB_PATH)
+    except Exception as e:
+        logger.error("Failed to initialize SQLite DB: %s", e)
+
+
+# Initialize DB at module load time
+_init_db()
+
+
+# ── DB wrapper functions ─────────────────────────────────────────────
+
+def db_log_tracking(team, leader, image_type, platform="", account_num="",
+                    amount="", ai_notes="", leader_comment="", status="pending",
+                    task_type="morning", message_id=""):
+    """Log an image/interaction to the local database."""
+    try:
+        now = _now_egypt()
+        conn = _get_db()
+        conn.execute(
+            """INSERT INTO tracking (date, time, team, leader, image_type, platform,
+               account_num, amount, ai_notes, leader_comment, status, task_type, message_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (now.strftime("%d/%m/%Y"), now.strftime("%H:%M"), team, leader,
+             image_type, platform, account_num, amount, ai_notes,
+             leader_comment, status, task_type, message_id),
+        )
+        conn.commit()
+        row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.close()
+        logger.info("DB: logged tracking %s %s %s (id=%d)", team, image_type, task_type, row_id)
+        return {"success": True, "id": row_id}
+    except Exception as e:
+        logger.error("DB tracking log error: %s", e)
+        return {"success": False, "error": str(e)}
+
+
+def db_get_tracking_today(team_name, task_type="morning"):
+    """Get all tracking entries for a team today."""
+    try:
+        today = _now_egypt().strftime("%d/%m/%Y")
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT * FROM tracking WHERE team=? AND task_type=? AND date=? ORDER BY id",
+            (team_name, task_type, today),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error("DB tracking read error: %s", e)
+        return []
+
+
+def db_get_team_accounts(team_name):
+    """Get known account counts for a team."""
+    try:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT platform, account_count FROM team_accounts WHERE team=?",
+            (team_name,),
+        ).fetchall()
+        conn.close()
+        return {r["platform"]: r["account_count"] for r in rows}
+    except Exception as e:
+        logger.error("DB account read error: %s", e)
+        return {}
+
+
+def db_save_team_accounts(team_name, platform, count):
+    """Save/update account count for a team."""
+    try:
+        now = _now_egypt().isoformat()
+        conn = _get_db()
+        conn.execute(
+            """INSERT INTO team_accounts (team, platform, account_count, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(team, platform) DO UPDATE SET account_count=?, updated_at=?""",
+            (team_name, platform, count, now, count, now),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error("DB save accounts error: %s", e)
+        return False
+
+
+def db_update_tracking_status(row_id, status, comment=""):
+    """Update status of a tracking entry."""
+    try:
+        conn = _get_db()
+        conn.execute(
+            "UPDATE tracking SET status=?, leader_comment=? WHERE id=?",
+            (status, comment, row_id),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error("DB update tracking status error: %s", e)
+        return False
+
+
+def db_log_conversation(team, leader, bot_message, user_reply="", context=""):
+    """Log a conversation exchange."""
+    try:
+        now = _now_egypt()
+        conn = _get_db()
+        conn.execute(
+            """INSERT INTO conversations (date, team, leader, bot_message, user_reply, context)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (now.strftime("%Y-%m-%d"), team, leader, bot_message[:500],
+             user_reply[:300], context),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error("DB conversation log error: %s", e)
+        return False
+
+
+def db_get_conversations(team_name, limit=10):
+    """Get recent conversations for a team."""
+    try:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT * FROM conversations WHERE team=? ORDER BY id DESC LIMIT ?",
+            (team_name, limit),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in reversed(rows)]
+    except Exception as e:
+        logger.error("DB conversation read error: %s", e)
+        return []
+
+
+def db_log_decision(team, leader, decision, reason="", owner_note=""):
+    """Log an owner decision."""
+    try:
+        now = _now_egypt()
+        conn = _get_db()
+        conn.execute(
+            """INSERT INTO decisions (date, team, leader, decision, reason, owner_note)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (now.strftime("%Y-%m-%d"), team, leader, decision, reason, owner_note),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error("DB decision log error: %s", e)
+        return False
+
+
+def db_log_learning(team, category, original, correction):
+    """Log a correction/learning."""
+    try:
+        now = _now_egypt()
+        conn = _get_db()
+        conn.execute(
+            """INSERT INTO learnings (date, team, category, original, correction)
+               VALUES (?, ?, ?, ?, ?)""",
+            (now.strftime("%Y-%m-%d %H:%M"), team, category,
+             original[:300], correction[:300]),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error("DB learning log error: %s", e)
+        return False
+
+
+def db_get_learnings(team_name="", limit=20):
+    """Get learnings, optionally filtered by team."""
+    try:
+        conn = _get_db()
+        if team_name:
+            rows = conn.execute(
+                "SELECT * FROM learnings WHERE team=? ORDER BY id DESC LIMIT ?",
+                (team_name, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM learnings ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in reversed(rows)]
+    except Exception as e:
+        logger.error("DB learnings read error: %s", e)
+        return []
+
+
+def db_log_daily_performance(team, date, spend, new_orders, delivered,
+                             cancel, hold, cpo, cpa, cancel_rate, source="sheet"):
+    """Log daily performance numbers."""
+    try:
+        conn = _get_db()
+        conn.execute(
+            """INSERT INTO daily_performance (date, team, spend, new_orders, delivered,
+               cancel, hold, cpo, cpa, cancel_rate, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(date, team) DO UPDATE SET
+               spend=?, new_orders=?, delivered=?, cancel=?, hold=?,
+               cpo=?, cpa=?, cancel_rate=?, source=?""",
+            (date, team, spend, new_orders, delivered, cancel, hold, cpo, cpa,
+             cancel_rate, source,
+             spend, new_orders, delivered, cancel, hold, cpo, cpa, cancel_rate, source),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error("DB daily performance log error: %s", e)
+        return False
+
+
+def db_get_daily_performance(team_name, days=30):
+    """Get performance history for a team."""
+    try:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT * FROM daily_performance WHERE team=? ORDER BY date DESC LIMIT ?",
+            (team_name, days),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in reversed(rows)]
+    except Exception as e:
+        logger.error("DB performance read error: %s", e)
+        return []
+
+
+def db_log_creative(team, creative_type, score, analysis, performance_impact=""):
+    """Log a creative analysis."""
+    try:
+        now = _now_egypt()
+        conn = _get_db()
+        conn.execute(
+            """INSERT INTO creative_history (date, team, creative_type, score, analysis, performance_impact)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (now.strftime("%Y-%m-%d"), team, creative_type, score,
+             analysis[:500], performance_impact),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error("DB creative log error: %s", e)
+        return False
+
+
+def db_log_budget(team, platform, payment_method, amount, currency="EGP",
+                  source="", notes=""):
+    """Log a budget/payment entry."""
+    try:
+        now = _now_egypt()
+        conn = _get_db()
+        conn.execute(
+            """INSERT INTO budget_tracking (date, team, platform, payment_method,
+               amount, currency, source, notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (now.strftime("%Y-%m-%d"), team, platform, payment_method,
+             amount, currency, source, notes),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error("DB budget log error: %s", e)
+        return False
+
+
+def db_get_missing_for_team(team_name, task_type="morning"):
+    """Check what's been received today vs what's needed.
+    Returns dict with 'complete' bool and 'missing' list and 'received' list."""
+    try:
+        received = db_get_tracking_today(team_name, task_type)
+        accounts = db_get_team_accounts(team_name)
+
+        received_types = set()
+        for entry in received:
+            received_types.add(entry.get("image_type", ""))
+
+        missing = []
+        if task_type == "morning":
+            if "fb_ads_dashboard" not in received_types:
+                missing.append({"type": "fb_ads_dashboard", "label": "داشبورد فيسبوك"})
+            if "fb_payment" not in received_types:
+                missing.append({"type": "fb_payment", "label": "صفحة دفع فيسبوك"})
+            has_tiktok = accounts.get("tiktok", 0) > 0
+            if has_tiktok:
+                if "tt_ads_dashboard" not in received_types:
+                    missing.append({"type": "tt_ads_dashboard", "label": "داشبورد تيك توك"})
+                if "tt_payment" not in received_types:
+                    missing.append({"type": "tt_payment", "label": "صفحة دفع تيك توك"})
+            if "order_sheet" not in received_types:
+                missing.append({"type": "order_sheet", "label": "شيت الطلبات"})
+        elif task_type == "evening":
+            if "order_sheet" not in received_types:
+                missing.append({"type": "order_sheet", "label": "شيت الطلبات (مسائي)"})
+
+        return {
+            "missing": missing,
+            "received": received,
+            "received_types": list(received_types),
+            "complete": len(missing) == 0,
+            "accounts": accounts,
+        }
+    except Exception as e:
+        logger.error("DB get_missing_for_team error: %s", e)
+        return {"missing": [], "received": [], "received_types": [], "complete": False, "accounts": {}}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -385,6 +813,13 @@ async def log_to_tracking(
             else:
                 raise RuntimeError(data.get("error", "unknown"))
 
+    # Also log to local DB (sync, fast)
+    db_log_tracking(
+        team=team, leader=leader, image_type=image_type, platform=platform,
+        account_num=account_num, amount=amount, ai_notes=ai_notes,
+        leader_comment="", status=status, task_type=task_type, message_id=message_id,
+    )
+
     try:
         return await _retry_async(_do_log, retries=2)
     except Exception as e:
@@ -393,7 +828,13 @@ async def log_to_tracking(
 
 
 async def get_team_tracking_today(team_name: str, task_type: str = "morning") -> list[dict]:
-    """Get all entries logged for a team today from the tracking sheet."""
+    """Get all entries logged for a team today. Tries DB first, falls back to Sheets."""
+    # Try DB first (fast, local)
+    db_results = db_get_tracking_today(team_name, task_type)
+    if db_results:
+        return db_results
+
+    # Fall back to Google Sheets
     try:
         params = {
             "action": "read",
@@ -450,7 +891,14 @@ async def get_missing_for_team(team_name: str, task_type: str = "morning") -> di
     """
     Compare what was received vs what's needed, return missing items.
     Returns: {missing: [...], received: [...], complete: bool}
+    Tries DB first, falls back to Sheets.
     """
+    # Try DB first
+    db_result = db_get_missing_for_team(team_name, task_type)
+    if db_result.get("received"):
+        return db_result
+
+    # Fall back to Sheets
     received = await get_team_tracking_today(team_name, task_type)
     accounts = await get_team_accounts(team_name)
 
@@ -517,12 +965,28 @@ def remember_exchange(team_name: str, bot_msg: str, user_reply: str | None = Non
     _conversation_memory[team_name].append(entry)
     _conversation_memory[team_name] = _conversation_memory[team_name][-MAX_MEMORY_PER_TEAM:]
 
+    # Also persist to DB
+    leader = get_leader(team_name)
+    db_log_conversation(team_name, leader, bot_msg[:500], user_reply or "")
+
 
 def get_recent_context(team_name: str, last_n: int = 3) -> str:
-    """Get recent conversation history as formatted text."""
+    """Get recent conversation history as formatted text. Tries DB first."""
+    # Try in-memory first (fastest)
     history = _conversation_memory.get(team_name, [])
+
+    # If in-memory is empty, try DB
     if not history:
+        db_convos = db_get_conversations(team_name, limit=last_n)
+        if db_convos:
+            lines = ["## محادثات سابقة اليوم:"]
+            for c in db_convos[-last_n:]:
+                lines.append(f"البوت: {c.get('bot_message', '')[:200]}")
+                if c.get("user_reply"):
+                    lines.append(f"التيم ليدر: {c['user_reply'][:150]}")
+            return "\n".join(lines)
         return ""
+
     lines = ["## محادثات سابقة اليوم:"]
     for ex in history[-last_n:]:
         lines.append(f"[{ex['time']}] البوت: {ex['bot'][:200]}")
@@ -566,8 +1030,20 @@ def save_learning(team_name: str, category: str, what_bot_said: str, correction:
     LEARNINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("Learning saved: %s - %s", category, correction[:50])
 
+    # Also persist to DB
+    db_log_learning(team_name, category, what_bot_said[:300], correction[:300])
+
 
 def get_learnings_for_prompt(team_name: str = "", last_n: int = 5) -> str:
+    # Try DB first
+    db_data = db_get_learnings(team_name, limit=last_n)
+    if db_data:
+        lines = ["## تصحيحات سابقة (اتعلمت منها):"]
+        for d in db_data[-last_n:]:
+            lines.append(f"- {d.get('date', '')}: {d.get('correction', '')}")
+        return "\n".join(lines)
+
+    # Fall back to JSON file
     data = load_learnings()
     if not data:
         return ""
