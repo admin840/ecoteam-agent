@@ -1271,52 +1271,77 @@ async def _show_help_menu(update, context, team_name):
 
 
 async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle help menu button clicks."""
+    """Handle help menu button clicks - ACTUALLY DO THE WORK."""
     query = update.callback_query
     await query.answer()
 
     chat_id = query.message.chat_id
     team_name = get_team_name(chat_id)
     if not team_name:
+        await query.message.reply_text("⚠️ الجروب ده مش مسجل عندي.")
         return
     leader = analyzer.get_leader(team_name)
-
     action = query.data.replace("help_", "")
+    logger.info("Help button: %s from %s (%s)", action, leader, team_name)
 
-    prompts = {
-        "analyze": f"يا {leader}، ابعتيلي screenshot أو اكتبيلي الأرقام (spend, orders) وأنا هحللهم.",
-        "weekly": f"يا {leader}، خليني أشوف أداء الأسبوع... ثانية واحدة 📊",
-        "creative": f"يا {leader}، ابعتيلي صورة أو فيديو الإعلان وأنا هقيّمه وأقولك رأيي 🎨",
-        "adcopy": f"يا {leader}، قوليلي اسم المنتج ووصفه وأنا هكتبلك 3 نسخ إعلانية ✍️",
-        "sheet": f"يا {leader}، ابعتيلي الملف (CSV أو Excel أو PDF) وأنا هحلله 📋",
-        "suggest": f"يا {leader}، خليني أشوف بياناتك وأقولك اقتراحات... ثانية 💡",
-        "question": f"يا {leader}، اسألي أي سؤال عن الإعلانات أو الأداء وأنا هجاوبك 😊",
+    # Step 1: Send "loading" message immediately (don't edit the button message)
+    loading_msgs = {
+        "analyze": f"📊 تمام يا {leader}! ابعتيلي screenshot أو اكتبيلي الأرقام وأنا هحللهم فوراً.",
+        "creative": f"🎨 تمام يا {leader}! ابعتيلي صورة أو فيديو الإعلان وأنا هقيّمه.",
+        "adcopy": f"✍️ تمام يا {leader}! قوليلي اسم المنتج ووصفه وأنا هكتبلك نسخ إعلانية.",
+        "sheet": f"📋 تمام يا {leader}! ابعتيلي الملف (CSV أو Excel أو PDF) وأنا هحلله.",
+        "question": f"😊 تمام يا {leader}! اسألي أي سؤال عن الإعلانات أو الأداء.",
     }
 
-    response_text = prompts.get(action, f"يا {leader}، قوليلي محتاجة إيه وأنا هساعدك!")
-
-    # For weekly and suggest, actually fetch and analyze
+    # Step 2: For "weekly" and "suggest" - actually work NOW
     if action == "weekly":
-        perf = analyzer.db_get_daily_performance(team_name, days=7)
-        if perf:
+        await query.message.reply_text(f"📈 خليني أشوف أداء {team_name} الأسبوع ده... ⏳")
+        _record_bot_message(chat_id)
+        try:
             analysis = await analyzer.analyze_text_message(
                 team_name,
-                "حلل أداء الأسبوع ده وقولي رأيك واقتراحاتك",
+                f"حلل أداء فريق {team_name} الأسبوع ده بالتفصيل. قولي الأرقام والـ trends واقتراحاتك. استخدم البيانات التاريخية من الـ DB.",
                 ""
             )
             if analysis:
-                response_text = analysis
-    elif action == "suggest":
-        analysis = await analyzer.analyze_text_message(
-            team_name,
-            "بناءً على كل البيانات عندك، إيه اقتراحاتك لتحسين الأداء؟",
-            ""
-        )
-        if analysis:
-            response_text = analysis
+                await send_long_message(context, chat_id, analysis)
+            else:
+                await context.bot.send_message(chat_id, f"يا {leader}، مش لاقي بيانات كافية للأسبوع ده. ابعتيلي الأرقام وأنا هحلل.")
+        except Exception as e:
+            logger.error("Weekly analysis error: %s", e)
+            await context.bot.send_message(chat_id, f"يا {leader}، حصل مشكلة في التحليل. جرّبي تاني بعد شوية.")
 
-    await safe_edit_message(query,response_text)
-    _record_bot_message(chat_id)
+    elif action == "suggest":
+        await query.message.reply_text(f"💡 خليني أفكر في اقتراحات لـ {team_name}... ⏳")
+        _record_bot_message(chat_id)
+        try:
+            analysis = await analyzer.analyze_text_message(
+                team_name,
+                f"بناءً على كل البيانات عندك عن فريق {team_name}، إيه اقتراحاتك لتحسين الأداء؟ CPO, CPA, cancel rate, budget allocation. كن محدد وعملي.",
+                ""
+            )
+            if analysis:
+                await send_long_message(context, chat_id, analysis)
+            else:
+                await context.bot.send_message(chat_id, f"يا {leader}، محتاج بيانات أكتر. ابعتيلي screenshot من الداشبورد.")
+        except Exception as e:
+            logger.error("Suggest analysis error: %s", e)
+            await context.bot.send_message(chat_id, f"يا {leader}، حصل مشكلة. جرّبي تاني.")
+
+    elif action == "adcopy":
+        await query.message.reply_text(f"✍️ تمام يا {leader}! اكتبيلي:\n\n1️⃣ اسم المنتج\n2️⃣ وصف بسيط\n3️⃣ السعر\n4️⃣ العرض أو الخصم (لو في)\n\nوأنا هكتبلك 3 نسخ إعلانية مختلفة 🚀")
+        _record_bot_message(chat_id)
+        # Set waiting state for ad copy
+        context.chat_data["waiting_adcopy"] = True
+
+    else:
+        # For analyze, creative, sheet, question - send prompt and wait
+        msg = loading_msgs.get(action, f"يا {leader}، قوليلي محتاجة إيه وأنا هساعدك!")
+        await query.message.reply_text(msg)
+        _record_bot_message(chat_id)
+
+    # Record in DB
+    analyzer.db_log_conversation(team_name, f"help_{action}", "")
 
 
 # ══════════════════════════════════════════════════════════════════════
