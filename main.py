@@ -44,6 +44,24 @@ def now_egypt() -> datetime:
     return datetime.now(EGYPT_TZ)
 
 
+# ── Listening window: track when bot last sent a message in each group ─
+_bot_last_msg_time: dict[int, datetime] = {}
+
+
+def _record_bot_message(chat_id: int):
+    """Record that the bot just sent a message in a group (not private chat)."""
+    if chat_id != OWNER_CHAT_ID:
+        _bot_last_msg_time[chat_id] = now_egypt()
+
+
+def _is_bot_listening(chat_id: int, window_minutes: int = 3) -> bool:
+    """Check if bot recently sent a message in this group (within window)."""
+    last = _bot_last_msg_time.get(chat_id)
+    if not last:
+        return False
+    return (now_egypt() - last).total_seconds() < window_minutes * 60
+
+
 # ── Teams: group_chat_id → team_name ─────────────────────────────────
 TEAMS: dict[int, str] = {
     -4757552003: "Kuwaitmall",
@@ -166,6 +184,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quick_check = await analyzer.quick_image_check(photo_bytes)
         if quick_check == "PERSONAL":
             await msg.reply_text(f"😄 يا {leader}، ده مش تقرير! لو محتاج حاجة أنا موجود 🙏")
+            _record_bot_message(chat_id)
             return
     except Exception as e:
         logger.warning("Quick image check failed, proceeding with buttons: %s", e)
@@ -205,6 +224,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📷 الصورة دي إيه؟",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    _record_bot_message(chat_id)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -280,6 +300,7 @@ async def callback_image_type(update: Update, context: ContextTypes.DEFAULT_TYPE
                 message_id=msg_id_str, status="✅",
             )
             await send_long_message(context, chat_id, creative_analysis)
+            _record_bot_message(chat_id)
             # Interactive buttons after creative analysis
             keyboard = [
                 [
@@ -293,9 +314,11 @@ async def callback_image_type(update: Update, context: ContextTypes.DEFAULT_TYPE
                 text="من ناحية الكريتيف... عايز أبعت التقييم للتيم؟",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
+            _record_bot_message(chat_id)
             analyzer.remember_exchange(team_name, creative_analysis[:300])
         else:
             await context.bot.send_message(chat_id=chat_id, text="⚠️ مش قادر أحلل الكريتيف.")
+            _record_bot_message(chat_id)
         # Clean up
         context.chat_data["pending_photos"].pop(msg_id_str, None)
         return
@@ -481,6 +504,7 @@ async def _process_image(
         text=conf_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    _record_bot_message(chat_id)
 
     # ── Multi-account tracking ──
     # Count how many entries of this type+platform exist today for this team
@@ -502,6 +526,7 @@ async def _process_image(
                 chat_id=chat_id,
                 text=f"تمام! ✅ حساب {same_type_count} من {total_accounts} ({platform_label}) وصل. لسه مستني حساب {remaining_str}",
             )
+            _record_bot_message(chat_id)
             # Store expected accounts info for auto-increment on next photo
             if "expected_accounts" not in context.chat_data:
                 context.chat_data["expected_accounts"] = {}
@@ -516,6 +541,7 @@ async def _process_image(
                 chat_id=chat_id,
                 text=f"ممتاز! 🎉 كل حسابات {platform_label} ({total_accounts}/{total_accounts}) وصلت!",
             )
+            _record_bot_message(chat_id)
             # Clear expected accounts for this type
             if "expected_accounts" in context.chat_data:
                 context.chat_data["expected_accounts"].pop(f"{analyzer_type}_{platform}", None)
@@ -529,6 +555,7 @@ async def _process_image(
         )
         if payment_analysis:
             await send_long_message(context, chat_id, payment_analysis)
+            _record_bot_message(chat_id)
             # Interactive follow-up buttons
             keyboard = [
                 [
@@ -542,6 +569,7 @@ async def _process_image(
                 text="أنا شايف إن الأرقام كويسة... صح كده؟",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
+            _record_bot_message(chat_id)
             analyzer.remember_exchange(team_name, payment_analysis[:300])
 
     # For dashboard/report images, do smart analysis
@@ -551,6 +579,7 @@ async def _process_image(
         )
         if analysis:
             await send_long_message(context, chat_id, analysis)
+            _record_bot_message(chat_id)
             # Store last analysis for correction flow
             context.chat_data["last_analysis"] = analysis
 
@@ -569,6 +598,7 @@ async def _process_image(
                     text="عايز أعمل إيه؟",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
+                _record_bot_message(chat_id)
             else:
                 keyboard = [
                     [
@@ -582,6 +612,7 @@ async def _process_image(
                     text="صح كده؟",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
+                _record_bot_message(chat_id)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -674,6 +705,7 @@ async def callback_owner_decision(update: Update, context: ContextTypes.DEFAULT_
         )
         try:
             await context.bot.send_message(chat_id=team_gid, text=deduct_msg)
+            _record_bot_message(team_gid)
             await query.edit_message_text(
                 query.message.text + f"\n\n⚠️ تم إرسال إنذار خصم لـ {team_name}."
             )
@@ -781,6 +813,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             team_name = TEAMS.get(target_gid, "")
             try:
                 await context.bot.send_message(chat_id=target_gid, text=text)
+                _record_bot_message(target_gid)
                 await msg.reply_text(f"✅ تم إرسال الرسالة لـ {team_name}")
             except Exception as e:
                 await msg.reply_text(f"❌ فشل الإرسال: {e}")
@@ -816,6 +849,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row_num:
             await analyzer.update_tracking_status(row_num, "✅", comment=text)
         await msg.reply_text(f"✅ تمام اتعلمت! شكراً على التصحيح 🙏")
+        _record_bot_message(chat_id)
         context.chat_data.pop("waiting_correction", None)
         return
 
@@ -826,6 +860,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row_num:
             await analyzer.update_tracking_status(row_num, "✅", comment=text)
         await msg.reply_text("✅ سجلت التعليق 📝")
+        _record_bot_message(chat_id)
         context.chat_data.pop("waiting_comment", None)
         return
 
@@ -833,6 +868,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.chat_data.get("waiting_imgtype"):
         context.chat_data.pop("waiting_imgtype", None)
         await msg.reply_text("✅ تمام، سجلت الوصف.")
+        _record_bot_message(chat_id)
         return
 
     # If replying to bot's message → handle as conversation
@@ -840,12 +876,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_user = await context.bot.get_me()
         if msg.reply_to_message.from_user.id == bot_user.id:
             reply_to_text = msg.reply_to_message.text or ""
+            leader = analyzer.get_leader(team_name)
             response = await analyzer.analyze_text_message(
                 team_name, text, reply_to_text
             )
             if response:
-                await send_long_message(context, chat_id, response)
+                sent = await send_long_message(context, chat_id, response)
+                _record_bot_message(chat_id)
+                analyzer.db_log_conversation(team_name, leader, response, text)
             return
+
+    # If bot recently sent a message in this group, treat any text as a response
+    if _is_bot_listening(chat_id):
+        leader = analyzer.get_leader(team_name)
+        response = await analyzer.analyze_text_message(
+            team_name, text, ""
+        )
+        if response:
+            sent = await send_long_message(context, chat_id, response)
+            _record_bot_message(chat_id)
+            analyzer.db_log_conversation(team_name, leader, response, text)
+        return
+
+    # If team leader sends a question or mentions help keywords
+    help_keywords = ["ممكن", "محتاج", "ساعدني", "عايز", "إيه", "ايه", "ليه", "كيف", "ازاي", "حلل", "اكتب", "شوف"]
+    if any(kw in text for kw in help_keywords) or "?" in text or "؟" in text:
+        leader = analyzer.get_leader(team_name)
+        response = await analyzer.analyze_text_message(team_name, text, "")
+        if response:
+            sent = await send_long_message(context, chat_id, response)
+            _record_bot_message(chat_id)
+            analyzer.db_log_conversation(team_name, leader, response, text)
+        return
 
     # Otherwise: ignore non-command text in groups
 
@@ -912,9 +974,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if analysis:
                 await send_long_message(context, chat_id, analysis)
+                _record_bot_message(chat_id)
                 analyzer.remember_exchange(team_name, analysis[:300])
             else:
                 await msg.reply_text(f"✅ استلمت الملف يا {leader}. مش قادر أحلله دلوقتي.")
+                _record_bot_message(chat_id)
         else:
             await msg.reply_text(f"✅ استلمت الملف يا {leader}. الملف فاضي أو صغير.")
 
@@ -958,6 +1022,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if analysis:
             await send_long_message(context, chat_id, analysis)
+            _record_bot_message(chat_id)
             # Interactive buttons after creative analysis
             msg_id = msg.message_id
             keyboard = [
@@ -972,6 +1037,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text="من ناحية الكريتيف... عايز أبعت التقييم للتيم؟",
                 reply_markup=InlineKeyboardMarkup(keyboard),
             )
+            _record_bot_message(chat_id)
         else:
             await msg.reply_text("⚠️ مش قادر أحلل الفيديو.")
     except Exception as e:
@@ -1003,6 +1069,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check all teams status from tracking sheet + team sheets."""
+    if not is_owner(update.message.from_user.id if update.message and update.message.from_user else 0):
+        return
     msg = update.message
     loading = await msg.reply_text("⏳ جاري المراجعة...")
 
@@ -1061,6 +1129,8 @@ async def cmd_afternoon(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate and show daily report."""
+    if not is_owner(update.message.from_user.id if update.message and update.message.from_user else 0):
+        return
     loading = await update.message.reply_text("⏳ جاري إعداد التقرير...")
     report = await analyzer.generate_smart_daily_report()
     if report:
@@ -1074,6 +1144,8 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show team details - let user pick a team."""
+    if not is_owner(update.message.from_user.id if update.message and update.message.from_user else 0):
+        return
     keyboard = []
     row = []
     for team_name in analyzer.TEAM_INFO:
@@ -1169,6 +1241,8 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Compare team screenshots vs sheet."""
+    if not is_owner(update.message.from_user.id if update.message and update.message.from_user else 0):
+        return
     chat_id = update.message.chat_id
     team_name = get_team_name(chat_id)
     if not team_name:
@@ -1280,6 +1354,7 @@ async def send_morning_prereminder(context: ContextTypes.DEFAULT_TYPE):
                     f"الديدلاين الساعة 11:00 ⏰"
                 ),
             )
+            _record_bot_message(gid)
         except Exception as e:
             logger.error("Pre-reminder failed for %s: %s", team_name, e)
         await asyncio.sleep(0.5)
@@ -1303,6 +1378,7 @@ async def send_smart_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
                         + "\n\nابعتيهم دلوقتي لو سمحتي 🙏"
                     ),
                 )
+                _record_bot_message(gid)
         except Exception as e:
             logger.error("Morning reminder failed for %s: %s", team_name, e)
         await asyncio.sleep(0.5)
@@ -1351,6 +1427,7 @@ async def _send_missing_reminder(context: ContextTypes.DEFAULT_TYPE, prefix: str
                     + "\n".join(f"  - {ml}" for ml in missing_labels)
                 ),
             )
+            _record_bot_message(gid)
         except Exception as e:
             logger.error("Reminder failed for %s: %s", team_name, e)
         await asyncio.sleep(0.3)
@@ -1463,6 +1540,7 @@ async def send_afternoon_questions(context: ContextTypes.DEFAULT_TYPE):
                     f"ابعتيلي screenshots أو اكتبي الأرقام 🙏"
                 ),
             )
+            _record_bot_message(gid)
         except Exception as e:
             logger.error("Afternoon questions failed for %s: %s", team_name, e)
         await asyncio.sleep(0.5)
@@ -1519,6 +1597,7 @@ async def _afternoon_followup(context: ContextTypes.DEFAULT_TYPE):
                     f"ابعتيلي الأرقام أو screenshots"
                 ),
             )
+            _record_bot_message(gid)
         except Exception as e:
             logger.error("Afternoon followup %d failed for %s: %s", step, team_name, e)
         await asyncio.sleep(0.3)
@@ -1623,6 +1702,7 @@ async def callback_analysis_reaction(update: Update, context: ContextTypes.DEFAU
         leader = analyzer.get_leader(team_name)
         alert_msg = f"⚠️ تنبيه يا {leader}:\nالأرقام محتاجة مراجعة. راجع/ي التحليل وبلغيني."
         await context.bot.send_message(chat_id=chat_id, text=alert_msg)
+        _record_bot_message(chat_id)
         await query.edit_message_text("✅ تم إرسال التنبيه للتيم.")
         analyzer.remember_exchange(team_name, "تنبيه اتبعت للتيم", user_reply="ابعت تنبيه")
 
@@ -1641,9 +1721,11 @@ async def callback_analysis_reaction(update: Update, context: ContextTypes.DEFAU
             )
             if deep_analysis:
                 await send_long_message(context, chat_id, deep_analysis)
+                _record_bot_message(chat_id)
                 analyzer.remember_exchange(team_name, deep_analysis[:300], user_reply="حلل أكتر")
             else:
                 await context.bot.send_message(chat_id=chat_id, text="مش قادر أحلل أكتر دلوقتي.")
+                _record_bot_message(chat_id)
 
 
 # ══════════════════════════════════════════════════════════════════════
