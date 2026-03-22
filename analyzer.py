@@ -217,6 +217,60 @@ def _init_db():
 _init_db()
 
 
+# ── DB Migrations ────────────────────────────────────────────────────
+DB_VERSION = 2  # Increment when schema changes
+
+
+def _migrate_db():
+    """Apply database migrations."""
+    try:
+        conn = _get_db()
+        # Check current version
+        try:
+            version = conn.execute("SELECT version FROM db_meta").fetchone()
+            current_version = version[0] if version else 0
+        except Exception:
+            conn.execute("CREATE TABLE IF NOT EXISTS db_meta (version INTEGER)")
+            conn.execute("INSERT INTO db_meta VALUES (0)")
+            conn.commit()
+            current_version = 0
+
+        if current_version < 1:
+            # Migration 1: Add indexes for faster queries
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tracking_team_date ON tracking(team, date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_perf_team_date ON daily_performance(team, date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_team ON conversations(team)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_learnings_team ON learnings(team)")
+            current_version = 1
+
+        if current_version < 2:
+            # Migration 2: Add product_orders table for PDF data
+            conn.execute("""CREATE TABLE IF NOT EXISTS product_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                team TEXT NOT NULL,
+                product_name TEXT,
+                quantity INTEGER DEFAULT 1,
+                price REAL,
+                area TEXT,
+                source TEXT DEFAULT 'pdf_import',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_products_team_date ON product_orders(team, date)")
+            current_version = 2
+
+        # Update version
+        conn.execute("UPDATE db_meta SET version = ?", (current_version,))
+        conn.commit()
+        conn.close()
+        logger.info("DB at version %d", current_version)
+    except Exception as e:
+        logger.error("DB migration error: %s", e)
+
+
+_migrate_db()
+
+
 # ── DB wrapper functions ─────────────────────────────────────────────
 
 def db_log_tracking(team, leader, image_type, platform="", account_num="",

@@ -8,6 +8,8 @@ import io
 import json
 import asyncio
 import logging
+import time as _time_mod
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
@@ -30,9 +32,22 @@ from telegram.ext import (
 import analyzer
 
 # ── Logging ──────────────────────────────────────────────────────────
+_log_dir = os.environ.get("DATA_DIR", ".")
+_file_handler = RotatingFileHandler(
+    os.path.join(_log_dir, "bot.log"),
+    maxBytes=5*1024*1024,  # 5MB
+    backupCount=3,
+    encoding="utf-8",
+)
+_file_handler.setLevel(logging.INFO)
+_file_handler.setFormatter(logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+))
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    handlers=[logging.StreamHandler(), _file_handler],
 )
 logger = logging.getLogger(__name__)
 
@@ -104,6 +119,26 @@ def _save_paused():
 
 
 paused_teams: set[int] = _load_paused()
+
+# ── Rate limiting ────────────────────────────────────────────────────
+_rate_limit: dict[str, list[float]] = {}  # team -> list of timestamps
+
+
+def _check_rate_limit(team_name: str, max_calls: int = 5, window_seconds: int = 300) -> bool:
+    """Returns True if within rate limit, False if exceeded."""
+    now = _time_mod.time()
+    if team_name not in _rate_limit:
+        _rate_limit[team_name] = []
+
+    # Remove old entries
+    _rate_limit[team_name] = [t for t in _rate_limit[team_name] if now - t < window_seconds]
+
+    if len(_rate_limit[team_name]) >= max_calls:
+        return False
+
+    _rate_limit[team_name].append(now)
+    return True
+
 
 # ── Image type labels ────────────────────────────────────────────────
 IMAGE_TYPE_LABELS = {
@@ -446,6 +481,14 @@ async def _process_image(
         return
 
     leader = analyzer.get_leader(team_name)
+
+    # Rate limit check before Claude API call
+    if not _check_rate_limit(team_name):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏳ يا {leader}، استنى شوية قبل ما تبعت تاني. البوت محتاج يلحق 😅",
+        )
+        return
 
     # Extract data using AI
     extracted = await analyzer.extract_image_data(image_bytes, analyzer_type, platform)
@@ -902,8 +945,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.reply_to_message and msg.reply_to_message.from_user:
         bot_user = await context.bot.get_me()
         if msg.reply_to_message.from_user.id == bot_user.id:
-            reply_to_text = msg.reply_to_message.text or ""
             leader = analyzer.get_leader(team_name)
+            if not _check_rate_limit(team_name):
+                await msg.reply_text(f"⏳ يا {leader}، استنى شوية قبل ما تبعت تاني. البوت محتاج يلحق 😅")
+                return
+            reply_to_text = msg.reply_to_message.text or ""
             response = await analyzer.analyze_text_message(
                 team_name, text, reply_to_text
             )
@@ -1280,6 +1326,56 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alert - رسالة لفريق\n"
         "/broadcast - رسالة لكل الفرق\n"
         "/pause - إيقاف/تشغيل فريق"
+    )
+
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Health check - owner only."""
+    if not is_owner(update.message.from_user.id if update.message and update.message.from_user else 0):
+        return
+
+    checks = []
+
+    # 1. Bot alive
+    checks.append("✅ البوت شغال")
+
+    # 2. DB check
+    try:
+        import sqlite3
+        conn = sqlite3.connect(analyzer.DB_PATH)
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        perf_count = conn.execute("SELECT COUNT(*) FROM daily_performance").fetchone()[0]
+        tracking_count = conn.execute("SELECT COUNT(*) FROM tracking").fetchone()[0]
+        conv_count = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        conn.close()
+        checks.append(f"✅ DB: {len(tables)} tables | {perf_count} performance | {tracking_count} tracking | {conv_count} conversations")
+    except Exception as e:
+        checks.append(f"❌ DB: {e}")
+
+    # 3. Claude API
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    checks.append(f"✅ Claude API: {'متصل' if api_key else '❌ مفيش مفتاح'}")
+
+    # 4. Server uptime
+    try:
+        with open("/proc/uptime") as f:
+            uptime_seconds = float(f.read().split()[0])
+            hours = int(uptime_seconds // 3600)
+            minutes = int((uptime_seconds % 3600) // 60)
+            checks.append(f"✅ السيرفر شغال من {hours} ساعة و {minutes} دقيقة")
+    except Exception:
+        checks.append("⚠️ مش قادر أقرأ uptime")
+
+    # 5. Teams count
+    checks.append(f"✅ {len(TEAMS)} فريق متصل")
+
+    # 6. Paused teams
+    if paused_teams:
+        paused_names = [TEAMS.get(gid, "?") for gid in paused_teams]
+        checks.append(f"⏸️ متوقفين: {', '.join(paused_names)}")
+
+    await update.message.reply_text(
+        "🏥 فحص النظام:\n\n" + "\n".join(checks)
     )
 
 
@@ -2042,8 +2138,21 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════════════════════
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors."""
-    logger.error("Exception while handling an update:", exc_info=context.error)
+    """Log errors and send critical errors to owner."""
+    logger.error("Exception: %s", context.error, exc_info=context.error)
+
+    # Only send to owner for serious errors (not network timeouts)
+    error_str = str(context.error)
+    if any(skip in error_str.lower() for skip in ["timeout", "timed out", "network", "connection"]):
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=f"🚨 خطأ في النظام:\n{error_str[:500]}"
+        )
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2065,6 +2174,7 @@ def main():
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("compare", cmd_compare))
     app.add_handler(CommandHandler("pause", cmd_pause))
+    app.add_handler(CommandHandler("health", cmd_health))
 
     # Callback queries (all go through router)
     app.add_handler(CallbackQueryHandler(callback_router))
