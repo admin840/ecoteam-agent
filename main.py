@@ -2143,7 +2143,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
     # Only send to owner for serious errors (not network timeouts)
     error_str = str(context.error)
-    if any(skip in error_str.lower() for skip in ["timeout", "timed out", "network", "connection"]):
+    if any(skip in error_str.lower() for skip in ["timeout", "timed out", "network", "connection", "conflict", "terminated by other"]):
         return
 
     try:
