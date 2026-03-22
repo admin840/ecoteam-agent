@@ -60,16 +60,20 @@ def main():
         reader = csv.reader(io.StringIO(csv_text))
         rows = list(reader)
 
-        # Find header row (contains "Date")
+        # Find header row (contains "date" anywhere in first cell)
         header_idx = -1
         for i, row in enumerate(rows):
-            if row and row[0].strip().lower() == "date":
+            if row and "date" in str(row[0]).strip().lower():
                 header_idx = i
                 break
 
         if header_idx == -1:
-            print(f"  No header found for {team}")
-            continue
+            # Try row 0 as header if data starts at row 1
+            if len(rows) > 1 and rows[1] and any(ch.isdigit() for ch in str(rows[1][0])):
+                header_idx = 0
+            else:
+                print(f"  No header found for {team}")
+                continue
 
         team_rows = 0
         prev_spend = 0
