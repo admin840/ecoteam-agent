@@ -2312,8 +2312,32 @@ async def analyze_pdf_orders(pdf_bytes: bytes, team_name: str, filename: str) ->
         logger.error("PDF parse error: %s", e)
         return f"مش قادر أقرأ الـ PDF: {e}"
 
-    if not pdf_text.strip():
-        return "الـ PDF فاضي أو مش قادر أقرأ النص منه."
+    logger.info("PDF text extracted: %d chars from %s", len(pdf_text), filename)
+
+    if not pdf_text.strip() or len(pdf_text.strip()) < 20:
+        # PDF might be scanned images - try sending as image to Claude
+        logger.warning("PDF text empty or too short (%d chars) - may be image-based", len(pdf_text))
+        try:
+            encoded = base64.b64encode(pdf_bytes).decode("utf-8")
+            client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+            message = await client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1000,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": encoded}},
+                        {"type": "text", "text": f"حلل شيت الطلبات ده للسواقين. استخرج المنتجات والمناطق والكميات والأسعار. رد بالعربي المصري. خاطب {leader} بالاسم."}
+                    ],
+                }],
+            )
+            response = message.content[0].text.strip()
+            if response:
+                remember_exchange(team_name, f"[PDF analysis] {response[:200]}")
+                return response
+        except Exception as e:
+            logger.error("PDF image analysis fallback error: %s", e)
+        return f"الـ PDF مش قادر أقرأه يا {leader}. ممكن تبعتيه كصورة أوضح؟"
 
     # Save raw text to DB for future reference
     db_log_conversation(team_name, leader, f"[PDF orders] {filename}", pdf_text[:500])
@@ -2380,8 +2404,8 @@ async def analyze_pdf_orders(pdf_bytes: bytes, team_name: str, filename: str) ->
         )
         return response
     except Exception as e:
-        logger.error("PDF analysis error: %s", e)
-        return ""
+        logger.error("PDF Claude analysis error for %s: %s", team_name, e, exc_info=True)
+        return f"حصل مشكلة في التحليل يا {leader}. جرّبي تبعتي الشيت تاني أو كصورة."
 
 
 async def analyze_document(file_content: str, team_name: str, filename: str) -> str:
