@@ -1,20 +1,31 @@
+"""
+EcoTeam Agent V2 - Telegram Bot
+Manages 11 advertising teams. Team leaders send daily screenshots.
+Bot tracks, analyzes, and reports using button-based classification.
+"""
 import os
+import io
 import json
 import asyncio
 import logging
-from datetime import datetime, timedelta, time, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
     filters,
     ContextTypes,
 )
+
+import analyzer
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -25,9 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ── Environment ──────────────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_CHAT_ID = int(os.environ["OWNER_CHAT_ID"])
-
-# ── Timezone: Egypt ──────────────────────────────────────────────────
+OWNER_CHAT_ID = 1126011968
 EGYPT_TZ = ZoneInfo("Africa/Cairo")
 
 
@@ -35,7 +44,7 @@ def now_egypt() -> datetime:
     return datetime.now(EGYPT_TZ)
 
 
-# ── Teams ────────────────────────────────────────────────────────────
+# ── Teams: group_chat_id → team_name ─────────────────────────────────
 TEAMS: dict[int, str] = {
     -4757552003: "Kuwaitmall",
     -1002683433256: "Meeven",
@@ -50,1598 +59,1325 @@ TEAMS: dict[int, str] = {
     -1002546787010: "Deelat",
 }
 
-# ── Report requirements ──────────────────────────────────────────────
-MORNING_REQUIRED = 3
-AFTERNOON_REQUIRED = 3
+# Reverse lookup: team_name → group_id
+TEAM_GIDS: dict[str, int] = {v: k for k, v in TEAMS.items()}
 
-# ── State tracking (persisted to file) ───────────────────────────────
-# Persistent storage: use /data volume on Railway, fallback to current dir
-_DATA_DIR = Path("/data") if Path("/data").exists() else Path(".")
-TRACKING_FILE = _DATA_DIR / "daily_tracking.json"
-
-
-def _load_tracking() -> dict:
-    """Load tracking state from file (survives restarts/deploys)."""
-    if TRACKING_FILE.exists():
-        try:
-            data = json.loads(TRACKING_FILE.read_text(encoding="utf-8"))
-            # Check if it's today's data
-            if data.get("date") == now_egypt().strftime("%Y-%m-%d"):
-                return data
-        except Exception:
-            pass
-    return {"date": now_egypt().strftime("%Y-%m-%d"),
-            "morning_photos": {}, "afternoon_photos": {},
-            "morning_types": {}, "afternoon_types": {}}
-
-
-def _save_tracking():
-    """Save tracking state to file."""
-    data = {
-        "date": now_egypt().strftime("%Y-%m-%d"),
-        "morning_photos": {str(k): v for k, v in morning_photos.items()},
-        "afternoon_photos": {str(k): v for k, v in afternoon_photos.items()},
-        "morning_types": {str(k): list(v) for k, v in morning_types.items()},
-        "afternoon_types": {str(k): list(v) for k, v in afternoon_types.items()},
-    }
-    TRACKING_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-
-
-def _restore_tracking():
-    """Restore tracking from file on startup."""
-    data = _load_tracking()
-    for k, v in data.get("morning_photos", {}).items():
-        morning_photos[int(k)] = v
-    for k, v in data.get("afternoon_photos", {}).items():
-        afternoon_photos[int(k)] = v
-    for k, v in data.get("morning_types", {}).items():
-        morning_types[int(k)] = set(v)
-    for k, v in data.get("afternoon_types", {}).items():
-        afternoon_types[int(k)] = set(v)
-
-
-# In-memory state (restored from file on startup)
-morning_photos: dict[int, int] = {}
-afternoon_photos: dict[int, int] = {}
-morning_types: dict[int, set[str]] = {}
-afternoon_types: dict[int, set[str]] = {}
+# Paused teams (group ids)
 paused_teams: set[int] = set()
 
-# Restore from file immediately
-_restore_tracking()
-
-# Map image types to the 3 required report categories
-REPORT_CATEGORY_MAP = {
-    "order_sheet": "sheet",
-    "budget_sheet": "budget",
-    "fb_payment": "budget",      # payment counts as budget proof
-    "tt_payment": "budget",
-    "fb_ads_dashboard": "dashboard",
-    "tt_ads_dashboard": "dashboard",
+# ── Image type labels ────────────────────────────────────────────────
+IMAGE_TYPE_LABELS = {
+    "fb_pay": ("💳 دفع فيسبوك", "fb_payment", "Facebook"),
+    "tt_pay": ("💳 دفع تيك توك", "tt_payment", "TikTok"),
+    "fb_dash": ("📊 داشبورد فيسبوك", "fb_ads_dashboard", "Facebook"),
+    "tt_dash": ("📊 داشبورد تيك توك", "tt_ads_dashboard", "TikTok"),
+    "order_sheet": ("📋 شيت الطلبات", "order_sheet", ""),
+    "other": ("📎 صورة تانية", "other", ""),
 }
 
-REPORT_CATEGORY_LABELS = {
-    "sheet": "شيت الطلبات اليومي",
-    "budget": "البادجيت المصروف / إيصال الدفع",
-    "dashboard": "داشبورد الإعلانات",
-}
 
-def get_missing_categories(gid: int, period: str) -> list[str]:
-    """Get list of missing report categories for a team."""
-    types = morning_types.get(gid, set()) if period == "morning" else afternoon_types.get(gid, set())
-    all_cats = {"sheet", "budget", "dashboard"}
-    return [REPORT_CATEGORY_LABELS[c] for c in all_cats - types]
+# ══════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════
 
-def get_received_categories(gid: int, period: str) -> list[str]:
-    """Get list of received report categories for a team."""
-    types = morning_types.get(gid, set()) if period == "morning" else afternoon_types.get(gid, set())
-    return [REPORT_CATEGORY_LABELS[c] for c in types]
-
-# Conversation states
-ALERT_PICK_TEAM, ALERT_TYPE_MSG, ALERT_CONFIRM = range(3)
-BROADCAST_TYPE_MSG, BROADCAST_CONFIRM = range(10, 12)
-TEAM_PICK, COMPARE_PICK, PAUSE_PICK = range(20, 23)
-
-# ── Feedback system ──────────────────────────────────────────────────
-# Store last bot analysis per group so we know what to correct
-_last_bot_analysis: dict[int, str] = {}  # gid -> last analysis text
+def get_team_name(chat_id: int) -> str | None:
+    """Get team name from group chat id."""
+    return TEAMS.get(chat_id)
 
 
-def feedback_keyboard() -> InlineKeyboardMarkup:
-    """Inline buttons for every bot analysis."""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ صح كده", callback_data="fb_correct"),
-            InlineKeyboardButton("❌ مش كده", callback_data="fb_wrong"),
-            InlineKeyboardButton("💬 تعليق الأدمن", callback_data="fb_edit"),
-        ]
-    ])
-
-# ── Deductions file ──────────────────────────────────────────────────
-DEDUCTIONS_FILE = _DATA_DIR / "deductions.json"
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_CHAT_ID
 
 
-def load_deductions() -> list[dict]:
-    if DEDUCTIONS_FILE.exists():
-        return json.loads(DEDUCTIONS_FILE.read_text(encoding="utf-8"))
-    return []
+def is_team_group(chat_id: int) -> bool:
+    return chat_id in TEAMS
 
 
-def save_deduction(team: str, reason: str):
-    data = load_deductions()
-    data.append({
-        "team": team, "date": now_egypt().strftime("%Y-%m-%d"),
-        "reason": reason, "amount": "TBD",
-    })
-    DEDUCTIONS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-# ── Helpers ──────────────────────────────────────────────────────────
-def is_owner(update: Update) -> bool:
-    return update.effective_user and update.effective_user.id == OWNER_CHAT_ID
-
-
-def team_name(gid: int) -> str:
-    return TEAMS.get(gid, str(gid))
-
-
-def teams_keyboard(include_all: bool = False) -> InlineKeyboardMarkup:
-    buttons = []
-    if include_all:
-        buttons.append([InlineKeyboardButton("📢 كل الفرق", callback_data="team_all")])
-    for gid, name in TEAMS.items():
-        buttons.append([InlineKeyboardButton(name, callback_data=f"team_{gid}")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def confirm_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ نعم", callback_data="confirm_yes"),
-         InlineKeyboardButton("❌ لا", callback_data="confirm_no")]
-    ])
-
-
-async def send_to_group(context: ContextTypes.DEFAULT_TYPE, gid: int, text: str, parse_mode: str = None):
-    try:
-        await context.bot.send_message(chat_id=gid, text=text, parse_mode=parse_mode)
-    except Exception as e:
-        logger.error("Send to %s failed: %s", team_name(gid), e)
-
-
-async def send_to_all(context: ContextTypes.DEFAULT_TYPE, text: str):
-    for gid in TEAMS:
-        if gid not in paused_teams:
-            await send_to_group(context, gid, text)
-
-
-async def notify_owner(context: ContextTypes.DEFAULT_TYPE, text: str):
-    try:
-        await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=text)
-    except Exception as e:
-        logger.error("Notify owner failed: %s", e)
+async def send_long_message(context, chat_id: int, text: str, **kwargs):
+    """Send a message, splitting if too long for Telegram's 4096 char limit."""
+    if len(text) <= 4000:
+        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    # Split on newlines
+    parts = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > 4000:
+            parts.append(current)
+            current = line
+        else:
+            current = current + "\n" + line if current else line
+    if current:
+        parts.append(current)
+    last_msg = None
+    for part in parts:
+        last_msg = await context.bot.send_message(chat_id=chat_id, text=part, **kwargs)
+    return last_msg
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Messages
+# PHOTO HANDLER - Step 1: Ask what type
 # ══════════════════════════════════════════════════════════════════════
-MORNING_MSG = (
-    "صباح الخير! 🌅\n\n"
-    "📋 مطلوب تقرير الصبح - 3 screenshots:\n"
-    "1️⃣ شيت الطلبات اليومي (Google Sheets)\n"
-    "2️⃣ البادجيت المصروف (Facebook/TikTok)\n"
-    "3️⃣ داشبورد الإعلانات للفيسبوك والتيك توك (بعد آخر طلب طلع الصبح)\n\n"
-    "شكراً لتعاونكم 🙏"
-)
 
-AFTERNOON_MSG = (
-    "مساء الخير! 🌇\n\n"
-    "📋 مطلوب تقرير الساعة 4 - 3 screenshots:\n"
-    "1️⃣ الحساب الإعلاني (Facebook/TikTok)\n"
-    "2️⃣ البادجيت المصروف لحد دلوقتي\n"
-    "3️⃣ عدد الطلبات لحد الساعة 4 من الفيسبوك أو التيك توك\n\n"
-    "شكراً 🙏"
-)
-
-WEEKLY_MSG = (
-    "📊 مطلوب التقرير الأسبوعي:\n\n"
-    "📸 Screenshots المطلوبة:\n"
-    "1️⃣ شيت الإعلانات الأسبوعي\n"
-    "2️⃣ شيت الطلبات\n"
-    "3️⃣ إجمالي عدد الطلبات\n"
-    "4️⃣ عدد الطلبات تم التسليم\n"
-    "5️⃣ عدد الطلبات الكانسل\n"
-    "6️⃣ البادجيت المصروف\n"
-    "7️⃣ سعر الطلب\n\n"
-    "شكراً 🙏"
-)
-
-SALARY_REMINDER_MSG = "📢 تذكير: غداً موعد تسليم شيت الرواتب"
-SALARY_REQUEST_MSG = (
-    "📋 مطلوب اليوم:\n"
-    "📸 Screenshot من تاب الرواتب\n\n"
-    "شكراً 🙏"
-)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Follow-up reminders
-# ══════════════════════════════════════════════════════════════════════
-def _get_missing(report_type: str) -> list[int]:
-    photos = morning_photos if report_type == "morning" else afternoon_photos
-    required = MORNING_REQUIRED if report_type == "morning" else AFTERNOON_REQUIRED
-    return [gid for gid in TEAMS if gid not in paused_teams and photos.get(gid, 0) < required]
-
-
-async def followup_reminder(context: ContextTypes.DEFAULT_TYPE):
-    data = context.job.data
-    report_type = data["report_type"]
-    step = data["step"]
-    missing = _get_missing(report_type)
-    if not missing:
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """When a photo arrives in a team group, download it and ask type."""
+    msg = update.message
+    if not msg or not msg.photo:
+        return
+    chat_id = msg.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+    if chat_id in paused_teams:
         return
 
-    type_label = "تقرير الصبح" if report_type == "morning" else "تقرير الساعة 4"
-    required = MORNING_REQUIRED if report_type == "morning" else AFTERNOON_REQUIRED
+    # Owner silence: if photo is from owner, still process (owner might test)
+    user_id = msg.from_user.id if msg.from_user else 0
 
-    if step <= 3:
-        for gid in missing:
-            photos = morning_photos if report_type == "morning" else afternoon_photos
-            count = photos.get(gid, 0)
-            await send_to_group(
-                context, gid,
-                f"⏰ تذكير ({step}): {type_label} غير مكتمل ({count}/{required})\n"
-                f"الرجاء إرسال الـ screenshots الناقصة."
-            )
-    elif step == 4:
-        from analyzer import get_leader as _gl, fetch_team_sheet, get_team_sheet_today
-        for gid in missing:
-            photos = morning_photos if report_type == "morning" else afternoon_photos
-            count = photos.get(gid, 0)
-            name = team_name(gid)
-            leader = _gl(name)
+    # Download the photo (largest size)
+    photo_file = await msg.photo[-1].get_file()
+    photo_bytes_io = io.BytesIO()
+    await photo_file.download_to_memory(photo_bytes_io)
+    photo_bytes = photo_bytes_io.getvalue()
 
-            # ── VERIFY before deducting: check ALL sources ──
-            # 1. Check if team sheet has today's data
-            sheet_updated = False
-            try:
-                rows = await fetch_team_sheet(name)
-                today_row = get_team_sheet_today(rows) if rows else None
-                if today_row:
-                    sheet_updated = True
-            except Exception:
-                pass
+    # Store pending photo in chat_data keyed by message id
+    msg_id = msg.message_id
+    if "pending_photos" not in context.chat_data:
+        context.chat_data["pending_photos"] = {}
+    context.chat_data["pending_photos"][str(msg_id)] = {
+        "file_id": msg.photo[-1].file_id,
+        "image_bytes": photo_bytes,
+        "user_id": user_id,
+        "timestamp": now_egypt().isoformat(),
+    }
 
-            if sheet_updated and count > 0:
-                # Sheet is updated + some photos sent = just missing screenshots
-                missing_cats = get_missing_categories(gid, report_type)
-                missing_text = " + ".join(missing_cats) if missing_cats else "screenshots"
-                await send_to_group(context, gid,
-                    f"يا {leader}، شيتك متحدث 👍 بس لسه ناقص: {missing_text}\n"
-                    f"ابعتهم عشان التقرير يكتمل 🙏")
-                await notify_owner(context,
-                    f"⚠️ {name} ({leader}) - الشيت متحدث بس screenshots ناقصة: {missing_text}")
-            elif sheet_updated and count == 0:
-                # Sheet is updated but no photos at all
-                await send_to_group(context, gid,
-                    f"يا {leader}، شيتك متحدث 👍 بس محتاج screenshots للتوثيق\n"
-                    f"ابعت الـ 3 screenshots (شيت + بادجيت + داشبورد) 🙏")
-                await notify_owner(context,
-                    f"⚠️ {name} ({leader}) - الشيت متحدث بس مفيش screenshots")
-            else:
-                # Sheet NOT updated AND no/partial photos = deduction
-                await send_to_group(context, gid,
-                    f"⚠️ يا {leader}، للأسف تم تسجيل خصم يوم بسبب عدم إكمال {type_label}.\n"
-                    f"لو عندك سبب أو اعتراض رد على الرسالة دي وهيتم تحويل الشكوى للمدير لإعادة النظر 🙏")
-                await notify_owner(context,
-                    f"🚨 {name} ({leader}) - خصم يوم: عدم إكمال {type_label} (الشيت فاضي + {count} صور)")
-                save_deduction(name, f"عدم إكمال {type_label}")
+    # Send type selection buttons
+    # Callback data format: itype_{msg_id}_{type}
+    # Must be ≤ 64 bytes
+    keyboard = [
+        [
+            InlineKeyboardButton("💳 دفع فيسبوك", callback_data=f"it_{msg_id}_fb_pay"),
+            InlineKeyboardButton("💳 دفع تيك توك", callback_data=f"it_{msg_id}_tt_pay"),
+        ],
+        [
+            InlineKeyboardButton("📊 داشبورد فيسبوك", callback_data=f"it_{msg_id}_fb_dash"),
+            InlineKeyboardButton("📊 داشبورد تيك توك", callback_data=f"it_{msg_id}_tt_dash"),
+        ],
+        [
+            InlineKeyboardButton("📋 شيت الطلبات", callback_data=f"it_{msg_id}_order_sheet"),
+            InlineKeyboardButton("📎 صورة تانية", callback_data=f"it_{msg_id}_other"),
+        ],
+    ]
+    await msg.reply_text(
+        "📷 الصورة دي إيه؟",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
-def schedule_report_followups(context_or_jq, report_type: str):
-    jq = context_or_jq if hasattr(context_or_jq, 'run_once') else context_or_jq.job_queue
-    for job in jq.get_jobs_by_name(f"{report_type}_followup"):
-        job.schedule_removal()
-    for i, mins in enumerate([15, 30, 45, 120], 1):
-        jq.run_once(
-            followup_reminder, when=timedelta(minutes=mins),
-            name=f"{report_type}_followup",
-            data={"report_type": report_type, "step": i},
+# ══════════════════════════════════════════════════════════════════════
+# CALLBACK: Image type selected
+# ══════════════════════════════════════════════════════════════════════
+
+async def callback_image_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User clicked an image type button."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # it_{msg_id}_{type}
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        return
+    _, msg_id_str, img_type = parts[0], parts[1], parts[2]
+
+    chat_id = query.message.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+
+    # Retrieve pending photo
+    pending = context.chat_data.get("pending_photos", {}).get(msg_id_str)
+    if not pending:
+        await query.edit_message_text("⚠️ الصورة دي قديمة، ابعتها تاني.")
+        return
+
+    type_info = IMAGE_TYPE_LABELS.get(img_type)
+    if not type_info:
+        await query.edit_message_text("⚠️ نوع مش معروف.")
+        return
+
+    label, analyzer_type, platform = type_info
+
+    # For "other" type: just acknowledge
+    if img_type == "other":
+        await query.edit_message_text(f"✅ تمام، سجلت الصورة كـ {label}")
+        # Log to tracking
+        leader = analyzer.get_leader(team_name)
+        await analyzer.log_to_tracking(
+            team=team_name, leader=leader, image_type="other",
+            platform="", account_num="1", amount="",
+            ai_notes="صورة تانية", task_type="morning",
+            message_id=msg_id_str, status="✅",
+        )
+        # Clean up
+        context.chat_data["pending_photos"].pop(msg_id_str, None)
+        return
+
+    # For order_sheet: no account count needed, go straight to processing
+    if img_type == "order_sheet":
+        await query.edit_message_text(f"⏳ جاري تحليل {label}...")
+        await _process_image(context, chat_id, team_name, msg_id_str,
+                             analyzer_type, platform, account_num=1, total_accounts=1)
+        return
+
+    # For payment/dashboard types: ask how many accounts
+    # Store selection in pending photo
+    pending["img_type"] = img_type
+    pending["analyzer_type"] = analyzer_type
+    pending["platform"] = platform
+    pending["label"] = label
+
+    keyboard = [
+        [
+            InlineKeyboardButton("1", callback_data=f"ac_{msg_id_str}_1"),
+            InlineKeyboardButton("2", callback_data=f"ac_{msg_id_str}_2"),
+            InlineKeyboardButton("3", callback_data=f"ac_{msg_id_str}_3"),
+            InlineKeyboardButton("4", callback_data=f"ac_{msg_id_str}_4"),
+            InlineKeyboardButton("5", callback_data=f"ac_{msg_id_str}_5"),
+        ],
+    ]
+    await query.edit_message_text(
+        f"كام حساب عندك على {platform}؟",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CALLBACK: Account count selected
+# ══════════════════════════════════════════════════════════════════════
+
+async def callback_account_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User selected account count."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # ac_{msg_id}_{count}
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        return
+    msg_id_str = parts[1]
+    count = int(parts[2])
+
+    chat_id = query.message.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+
+    pending = context.chat_data.get("pending_photos", {}).get(msg_id_str)
+    if not pending:
+        await query.edit_message_text("⚠️ الصورة دي قديمة، ابعتها تاني.")
+        return
+
+    analyzer_type = pending.get("analyzer_type", "other")
+    platform = pending.get("platform", "")
+    label = pending.get("label", "")
+
+    # Store total accounts
+    pending["total_accounts"] = count
+
+    # Track which account number this is (first photo = account 1)
+    current_account = pending.get("current_account", 1)
+
+    await query.edit_message_text(
+        f"⏳ جاري تحليل {label} (حساب {current_account} من {count})..."
+    )
+    await _process_image(context, chat_id, team_name, msg_id_str,
+                         analyzer_type, platform, current_account, count)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PROCESS IMAGE: Extract data, log, show confirmation
+# ══════════════════════════════════════════════════════════════════════
+
+async def _process_image(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    team_name: str,
+    msg_id_str: str,
+    analyzer_type: str,
+    platform: str,
+    account_num: int,
+    total_accounts: int,
+):
+    """Extract data from image, log to tracking, show confirmation."""
+    pending = context.chat_data.get("pending_photos", {}).get(msg_id_str)
+    if not pending:
+        return
+
+    image_bytes = pending.get("image_bytes")
+    if not image_bytes:
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ مش لاقي الصورة.")
+        return
+
+    leader = analyzer.get_leader(team_name)
+
+    # Extract data using AI
+    extracted = await analyzer.extract_image_data(image_bytes, analyzer_type, platform)
+
+    # Check for type mismatch
+    if extracted.get("_type_mismatch"):
+        notes = extracted.get("notes", "")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ الصورة دي شكلها مش {analyzer.IMAGE_TYPES.get(analyzer_type, analyzer_type)}.\n{notes}\nلو أنا غلطان، كمل عادي.",
         )
 
+    # Build summary
+    summary = analyzer.generate_quick_summary(extracted)
+    amount_str = ""
+    if analyzer_type in analyzer.PAYMENT_IMAGE_TYPES:
+        amt = extracted.get("amount")
+        amount_str = str(amt) if amt else ""
+    elif analyzer_type in analyzer.REPORT_IMAGE_TYPES:
+        spend = extracted.get("spend")
+        amount_str = str(spend) if spend else ""
 
-# ══════════════════════════════════════════════════════════════════════
-# AUTO scheduled jobs (Egypt timezone)
-# ══════════════════════════════════════════════════════════════════════
-async def auto_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Auto-send SMART morning reminder at 11:00 AM Egypt time.
-    Checks who already sent, and customizes the message for each team."""
-    from analyzer import get_leader
+    # Determine task_type based on time
+    hour = now_egypt().hour
+    task_type = "morning" if hour < 14 else "evening"
 
-    sent_count = 0
-    already_done = 0
-    partial = 0
+    # Log to tracking sheet
+    ai_notes = json.dumps(
+        {k: v for k, v in extracted.items() if not k.startswith("_") and v is not None},
+        ensure_ascii=False,
+    )[:500]
 
-    for gid, name in TEAMS.items():
-        if gid in paused_teams:
-            continue
+    log_result = await analyzer.log_to_tracking(
+        team=team_name,
+        leader=leader,
+        image_type=analyzer_type,
+        platform=platform,
+        account_num=f"{account_num}/{total_accounts}",
+        amount=amount_str,
+        ai_notes=ai_notes,
+        task_type=task_type,
+        message_id=msg_id_str,
+        status="⏳",
+    )
 
-        leader = get_leader(name)
-        count = morning_photos.get(gid, 0)
+    row_num = log_result.get("row", 0)
 
-        received = get_received_categories(gid, "morning")
-        missing_cats = get_missing_categories(gid, "morning")
+    # Store row num for confirmation callback
+    pending["tracking_row"] = row_num
+    pending["extracted"] = extracted
+    pending["summary"] = summary
 
-        if not missing_cats:
-            already_done += 1
-            await send_to_group(context, gid,
-                f"صباح الخير يا {leader}! 🌅\nتقريرك مكتمل ✅ شكراً إنك بعتت بدري 💪")
-        elif received:
-            partial += 1
-            received_text = " ✅\n- ".join(received)
-            missing_text = "\n- ".join(missing_cats)
-            await send_to_group(context, gid,
-                f"صباح الخير يا {leader}! 🌅\n"
-                f"وصلني وشكراً ليك 🙏:\n- {received_text} ✅\n\n"
-                f"لسه مستني:\n- {missing_text}\n"
-                f"ابعتهم لما يكونوا جاهزين 💪")
-        else:
-            sent_count += 1
-            await send_to_group(context, gid, MORNING_MSG)
+    # Build confirmation message + buttons
+    type_label = analyzer.IMAGE_TYPES.get(analyzer_type, analyzer_type)
+    conf_text = (
+        f"تمام سجلت ✅\n"
+        f"{type_label} - حساب {account_num} من {total_accounts}\n"
+        f"{summary}\n"
+        f"صح كده؟"
+    )
 
-    schedule_report_followups(context.job_queue, "morning")
-    await notify_owner(context,
-        f"✅ تذكير الصبح (11:00 AM)\n"
-        f"  مكتمل: {already_done} | ناقص: {partial} | لم يبدأ: {sent_count}")
-    logger.info("Smart morning reminder: done=%d partial=%d new=%d", already_done, partial, sent_count)
-
-
-async def auto_afternoon_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Auto-send SMART afternoon reminder at 4:00 PM Egypt time."""
-    from analyzer import get_leader
-
-    sent_count = 0
-    already_done = 0
-    partial = 0
-
-    for gid, name in TEAMS.items():
-        if gid in paused_teams:
-            continue
-
-        leader = get_leader(name)
-        count = afternoon_photos.get(gid, 0)
-
-        received = get_received_categories(gid, "afternoon")
-        missing_cats = get_missing_categories(gid, "afternoon")
-
-        if not missing_cats:
-            already_done += 1
-            await send_to_group(context, gid,
-                f"مساء الخير يا {leader}! 🌇\nتقرير العصر مكتمل ✅ شكراً 💪")
-        elif received:
-            partial += 1
-            received_text = " ✅\n- ".join(received)
-            missing_text = "\n- ".join(missing_cats)
-            await send_to_group(context, gid,
-                f"مساء الخير يا {leader}! 🌇\n"
-                f"وصلني وشكراً 🙏:\n- {received_text} ✅\n\n"
-                f"لسه مستني:\n- {missing_text}")
-        else:
-            sent_count += 1
-            await send_to_group(context, gid, AFTERNOON_MSG)
-
-    schedule_report_followups(context.job_queue, "afternoon")
-    await notify_owner(context,
-        f"✅ تذكير العصر (4:00 PM)\n"
-        f"  مكتمل: {already_done} | ناقص: {partial} | لم يبدأ: {sent_count}")
-    logger.info("Smart afternoon reminder: done=%d partial=%d new=%d", already_done, partial, sent_count)
-
-
-async def daily_noon_report(context: ContextTypes.DEFAULT_TYPE):
-    """12:00 PM Egypt - Send daily summary to owner."""
-    from analyzer import fetch_master_data, get_team_today_data, get_leader
-
-    today = now_egypt().strftime("%d/%m/%Y")
-    t = now_egypt().strftime("%I:%M %p")
-
-    all_data = await fetch_master_data()
-
-    lines = [
-        "╔══════════════════════════════╗",
-        "║     📊  الملخص اليومي        ║",
-        f"║  📅 {today}   ⏰ {t}   ║",
-        "╚══════════════════════════════╝",
-        "",
+    keyboard = [
+        [
+            InlineKeyboardButton("صح ✅", callback_data=f"cf_{msg_id_str}_ok"),
+            InlineKeyboardButton("مش كده ❌", callback_data=f"cf_{msg_id_str}_wrong"),
+            InlineKeyboardButton("تعليق 💬", callback_data=f"cf_{msg_id_str}_comment"),
+        ],
     ]
 
-    # ── Morning Report ──
-    lines.append("┌─── 🌅 تقرير الصبح ───┐")
-    lines.append("")
-    m_done = 0
-    for gid, name in TEAMS.items():
-        leader = get_leader(name)
-        count = morning_photos.get(gid, 0)
-        paused = " ⏸" if gid in paused_teams else ""
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=conf_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
-        if count >= MORNING_REQUIRED:
-            icon = "✅"
-            m_done += 1
-        elif count > 0:
-            icon = f"🟡 {count}/{MORNING_REQUIRED}"
+    # For payment images, also do a smart payment analysis
+    if analyzer_type in analyzer.PAYMENT_IMAGE_TYPES:
+        payment_analysis = await analyzer.handle_payment_image(
+            image_bytes, team_name, analyzer_type
+        )
+        if payment_analysis:
+            await send_long_message(context, chat_id, payment_analysis)
+
+    # For dashboard/report images, do smart analysis
+    elif analyzer_type in analyzer.REPORT_IMAGE_TYPES:
+        analysis = await analyzer.smart_analysis(
+            team_name, extracted, analyzer_type, image_bytes
+        )
+        if analysis:
+            await send_long_message(context, chat_id, analysis)
+            # Store last analysis for correction flow
+            context.chat_data["last_analysis"] = analysis
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CALLBACK: Confirmation (ok / wrong / comment)
+# ══════════════════════════════════════════════════════════════════════
+
+async def callback_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User confirmed, rejected, or wants to comment on extraction."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # cf_{msg_id}_{action}
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        return
+    msg_id_str = parts[1]
+    action = parts[2]
+
+    chat_id = query.message.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+
+    pending = context.chat_data.get("pending_photos", {}).get(msg_id_str)
+    row_num = pending.get("tracking_row", 0) if pending else 0
+
+    if action == "ok":
+        # Confirmed - update status
+        if row_num:
+            await analyzer.update_tracking_status(row_num, "✅")
+        await query.edit_message_text(query.message.text + "\n\n✅ تم التأكيد!")
+        # Clean up
+        if pending:
+            context.chat_data["pending_photos"].pop(msg_id_str, None)
+
+    elif action == "wrong":
+        # User says extraction is wrong
+        await query.edit_message_text(
+            query.message.text + "\n\n❌ إيه الغلط؟ ابعت الرقم الصح وهتعلم منك."
+        )
+        # Set waiting_correction state
+        context.chat_data["waiting_correction"] = {
+            "msg_id": msg_id_str,
+            "row_num": row_num,
+            "team_name": team_name,
+        }
+
+    elif action == "comment":
+        # User wants to add a comment
+        await query.edit_message_text(
+            query.message.text + "\n\n💬 اكتب التعليق..."
+        )
+        context.chat_data["waiting_comment"] = {
+            "msg_id": msg_id_str,
+            "row_num": row_num,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CALLBACK: Owner deduction decision
+# ══════════════════════════════════════════════════════════════════════
+
+async def callback_owner_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner decides on a team: ok / deduct / recheck / msg."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data  # od_{team_gid}_{action}
+    parts = data.split("_", 2)
+    if len(parts) < 3:
+        return
+    team_gid = int(parts[1])
+    action = parts[2]
+    team_name = TEAMS.get(team_gid, "")
+    if not team_name:
+        return
+    leader = analyzer.get_leader(team_name)
+
+    if action == "ok":
+        await query.edit_message_text(
+            query.message.text + f"\n\n✅ تمام - {team_name} مفيش خصم."
+        )
+
+    elif action == "deduct":
+        # Send deduction message to the team group
+        deduct_msg = (
+            f"⚠️ تنبيه يا {leader}:\n"
+            f"في ناقص من تقرير الصبح مبعتش.\n"
+            f"هيتم الخصم حسب القواعد."
+        )
+        try:
+            await context.bot.send_message(chat_id=team_gid, text=deduct_msg)
+            await query.edit_message_text(
+                query.message.text + f"\n\n⚠️ تم إرسال إنذار خصم لـ {team_name}."
+            )
+        except Exception as e:
+            logger.error("Failed to send deduction to %s: %s", team_name, e)
+            await query.edit_message_text(
+                query.message.text + f"\n\n❌ فشل الإرسال: {e}"
+            )
+
+    elif action == "recheck":
+        await query.edit_message_text(
+            query.message.text + "\n\n🔄 جاري المراجعة تاني..."
+        )
+        # Re-check and send updated report
+        report = await analyzer.build_owner_team_report(team_name)
+        updated_text = _format_owner_team_report(team_name, team_gid, report)
+        keyboard = _build_owner_decision_keyboard(team_gid)
+        await context.bot.send_message(
+            chat_id=OWNER_CHAT_ID,
+            text=f"🔄 مراجعة محدثة:\n\n{updated_text}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    elif action == "msg":
+        # Ask owner what message to send
+        await query.edit_message_text(
+            query.message.text + "\n\n💬 اكتب الرسالة اللي عايز تبعتها..."
+        )
+        context.bot_data["owner_msg_target"] = team_gid
+
+
+def _format_owner_team_report(team_name: str, team_gid: int, report: dict) -> str:
+    """Format a team report for the owner."""
+    leader = report["leader"]
+    parts = [f"⚠️ {team_name} ({leader})"]
+
+    # What they sent
+    received_types = report.get("received_types", [])
+    if received_types:
+        type_labels = []
+        for rt in received_types:
+            label = analyzer.IMAGE_TYPES.get(rt, rt)
+            type_labels.append(f"{label} ✅")
+        parts.append(f"بعتت: {' + '.join(type_labels)}")
+
+    # What's missing
+    if not report["complete"]:
+        missing_labels = [m["label"] for m in report["missing"]]
+        parts.append(f"ناقص: {', '.join(missing_labels)}")
+    else:
+        parts.append("✅ بعتت كل المطلوب")
+
+    # Sheet status
+    sd = report.get("sheet_data", {})
+    if report["sheet_status"] == "updated":
+        spend = sd.get("spend", 0)
+        orders = sd.get("orders", 0)
+        cpo = sd.get("cpo")
+        parts.append(
+            f"الشيت: متحدث (Spend: {spend:,.0f} | Orders: {orders:.0f}"
+            + (f" | CPO: {cpo:.0f}" if cpo else "")
+            + ")"
+        )
+    else:
+        parts.append("الشيت: مش متحدث")
+
+    if report.get("recommendation"):
+        parts.append(report["recommendation"])
+
+    return "\n".join(parts)
+
+
+def _build_owner_decision_keyboard(team_gid: int) -> list[list[InlineKeyboardButton]]:
+    """Build inline keyboard for owner decision on a team."""
+    return [
+        [
+            InlineKeyboardButton("✅ تمام", callback_data=f"od_{team_gid}_ok"),
+            InlineKeyboardButton("⚠️ خصم", callback_data=f"od_{team_gid}_deduct"),
+        ],
+        [
+            InlineKeyboardButton("🔄 راجع تاني", callback_data=f"od_{team_gid}_recheck"),
+            InlineKeyboardButton("💬 رسالة", callback_data=f"od_{team_gid}_msg"),
+        ],
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TEXT HANDLER
+# ══════════════════════════════════════════════════════════════════════
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages in team groups."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    chat_id = msg.chat_id
+    text = msg.text.strip()
+    user_id = msg.from_user.id if msg.from_user else 0
+
+    # === OWNER private chat: handle owner_msg_target ===
+    if chat_id == OWNER_CHAT_ID or user_id == OWNER_CHAT_ID:
+        target_gid = context.bot_data.get("owner_msg_target")
+        if target_gid and chat_id == OWNER_CHAT_ID:
+            # Owner is sending a message to a team
+            team_name = TEAMS.get(target_gid, "")
+            try:
+                await context.bot.send_message(chat_id=target_gid, text=text)
+                await msg.reply_text(f"✅ تم إرسال الرسالة لـ {team_name}")
+            except Exception as e:
+                await msg.reply_text(f"❌ فشل الإرسال: {e}")
+            context.bot_data.pop("owner_msg_target", None)
+            return
+
+    # === Group message handling ===
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+    if chat_id in paused_teams:
+        return
+
+    # Owner silence mode in groups
+    if is_owner(user_id) and not text.startswith("/"):
+        # Owner sends text in group - bot stays silent
+        # Unless they mention the bot or reply to bot
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            bot_user = await context.bot.get_me()
+            if msg.reply_to_message.from_user.id != bot_user.id:
+                return
         else:
-            icon = f"❌ 0/{MORNING_REQUIRED}"
+            return
 
-        # Sheet data
-        sheet_data = get_team_today_data(all_data, name)
-        sheet_line = ""
-        if sheet_data:
-            from analyzer import _safe_num as _sn
-            spend = _sn(sheet_data.get("Spend اليوم", 0)) or 0
-            orders = _sn(sheet_data.get("Orders اليوم", 0)) or 0
-            cpo = sheet_data.get("CPO اليوم", "-")
-            action = sheet_data.get("\U0001f6a6 اليوم", "")
-            if spend or orders:
-                sheet_line = f"\n     💰{spend:,.0f} | 📦{int(orders)} | CPO:{cpo} {action}"
+    # Check if waiting for correction
+    correction_state = context.chat_data.get("waiting_correction")
+    if correction_state:
+        team = correction_state["team_name"]
+        row_num = correction_state["row_num"]
+        # Save the correction as a learning
+        last_analysis = context.chat_data.get("last_analysis", "")
+        analyzer.save_learning(team, "correction", last_analysis[:200], text)
+        if row_num:
+            await analyzer.update_tracking_status(row_num, "✅", comment=text)
+        await msg.reply_text(f"✅ تمام اتعلمت! شكراً على التصحيح 🙏")
+        context.chat_data.pop("waiting_correction", None)
+        return
 
-        lines.append(f"  {icon} {name} ({leader}){paused}{sheet_line}")
+    # Check if waiting for comment
+    comment_state = context.chat_data.get("waiting_comment")
+    if comment_state:
+        row_num = comment_state["row_num"]
+        if row_num:
+            await analyzer.update_tracking_status(row_num, "✅", comment=text)
+        await msg.reply_text("✅ سجلت التعليق 📝")
+        context.chat_data.pop("waiting_comment", None)
+        return
 
-    lines.append("")
+    # Check if waiting for image type description
+    if context.chat_data.get("waiting_imgtype"):
+        context.chat_data.pop("waiting_imgtype", None)
+        await msg.reply_text("✅ تمام، سجلت الوصف.")
+        return
 
-    # ── Afternoon Report ──
-    lines.append("┌─── 🌇 تقرير العصر ───┐")
-    lines.append("")
-    a_done = 0
-    for gid, name in TEAMS.items():
-        leader = get_leader(name)
-        count = afternoon_photos.get(gid, 0)
-        paused = " ⏸" if gid in paused_teams else ""
+    # If replying to bot's message → handle as conversation
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        bot_user = await context.bot.get_me()
+        if msg.reply_to_message.from_user.id == bot_user.id:
+            reply_to_text = msg.reply_to_message.text or ""
+            response = await analyzer.analyze_text_message(
+                team_name, text, reply_to_text
+            )
+            if response:
+                await send_long_message(context, chat_id, response)
+            return
 
-        if count >= AFTERNOON_REQUIRED:
-            icon = "✅"
-            a_done += 1
-        elif count > 0:
-            icon = f"🟡 {count}/{AFTERNOON_REQUIRED}"
+    # Otherwise: ignore non-command text in groups
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DOCUMENT / VIDEO HANDLERS
+# ══════════════════════════════════════════════════════════════════════
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document uploads (CSV, XLSX) from team leaders."""
+    msg = update.message
+    if not msg or not msg.document:
+        return
+    chat_id = msg.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+
+    doc = msg.document
+    fname = (doc.file_name or "").lower()
+    if not any(fname.endswith(ext) for ext in (".csv", ".xlsx", ".xls")):
+        return
+
+    await msg.reply_text("⏳ جاري تحليل الملف...")
+
+    try:
+        file = await doc.get_file()
+        file_bytes_io = io.BytesIO()
+        await file.download_to_memory(file_bytes_io)
+        # For now, acknowledge receipt
+        leader = analyzer.get_leader(team_name)
+        await msg.reply_text(
+            f"✅ استلمت الملف يا {leader}. هشتغل عليه."
+        )
+    except Exception as e:
+        logger.error("Document download error: %s", e)
+        await msg.reply_text("⚠️ مش قادر أفتح الملف.")
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle video uploads - creative analysis."""
+    msg = update.message
+    if not msg:
+        return
+    chat_id = msg.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+
+    video = msg.video or msg.video_note
+    if not video:
+        return
+
+    await msg.reply_text("⏳ جاري تحليل الفيديو... ده بياخد شوية.")
+
+    try:
+        file = await video.get_file()
+        video_bytes_io = io.BytesIO()
+        await file.download_to_memory(video_bytes_io)
+        video_bytes = video_bytes_io.getvalue()
+
+        # Get thumbnail if available
+        thumb_bytes = None
+        if msg.video and msg.video.thumbnail:
+            thumb_file = await msg.video.thumbnail.get_file()
+            thumb_io = io.BytesIO()
+            await thumb_file.download_to_memory(thumb_io)
+            thumb_bytes = thumb_io.getvalue()
+
+        analysis = await analyzer.analyze_video_creative(
+            video_bytes, team_name, thumb_bytes
+        )
+        if analysis:
+            await send_long_message(context, chat_id, analysis)
         else:
-            icon = f"❌ 0/{AFTERNOON_REQUIRED}"
+            await msg.reply_text("⚠️ مش قادر أحلل الفيديو.")
+    except Exception as e:
+        logger.error("Video analysis error: %s", e)
+        await msg.reply_text("⚠️ حصل مشكلة في تحليل الفيديو.")
 
-        lines.append(f"  {icon} {name} ({leader}){paused}")
 
-    lines.append("")
-    lines.append("┌─── 📈 الإجمالي ───┐")
-    lines.append(f"  الصبح: {m_done}/{len(TEAMS)}  |  العصر: {a_done}/{len(TEAMS)}")
+# ══════════════════════════════════════════════════════════════════════
+# COMMANDS
+# ══════════════════════════════════════════════════════════════════════
 
-    # Warnings
-    missing_morning = [team_name(g) for g in TEAMS if morning_photos.get(g, 0) < MORNING_REQUIRED and g not in paused_teams]
-    missing_afternoon = [team_name(g) for g in TEAMS if afternoon_photos.get(g, 0) < AFTERNOON_REQUIRED and g not in paused_teams]
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Welcome message."""
+    await update.message.reply_text(
+        "أهلاً! أنا EcoBot 🤖\n"
+        "مدير التسويق الرقمي بتاعكم.\n"
+        "ابعتلي صور التقارير وأنا هحللها.\n\n"
+        "الأوامر:\n"
+        "/status - حالة كل الفرق\n"
+        "/morning - تذكير الصبح\n"
+        "/afternoon - أسئلة الـ 4\n"
+        "/report - التقرير اليومي\n"
+        "/team - تفاصيل فريق\n"
+        "/alert - رسالة لفريق\n"
+        "/broadcast - رسالة لكل الفرق\n"
+        "/pause - إيقاف/تشغيل فريق"
+    )
 
-    if missing_morning or missing_afternoon:
-        lines.append("")
-        lines.append("┌─── ⚠️ تحذيرات ───┐")
-        if missing_morning:
-            lines.append(f"  صبح ناقص: {', '.join(missing_morning)}")
-        if missing_afternoon:
-            lines.append(f"  عصر ناقص: {', '.join(missing_afternoon)}")
 
-    await notify_owner(context, "\n".join(lines))
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check all teams status from tracking sheet + team sheets."""
+    msg = update.message
+    loading = await msg.reply_text("⏳ جاري المراجعة...")
+
+    parts = [f"📊 حالة الفرق - {now_egypt().strftime('%Y-%m-%d %H:%M')}\n"]
+
+    for team_name in analyzer.TEAM_INFO:
+        try:
+            report = await analyzer.build_owner_team_report(team_name)
+            leader = report["leader"]
+            line = f"{'✅' if report['complete'] else '⚠️'} {team_name} ({leader}): "
+
+            if report["sheet_status"] == "updated":
+                sd = report["sheet_data"]
+                spend = sd.get("spend", 0)
+                orders = sd.get("orders", 0)
+                cpo = sd.get("cpo")
+                line += f"Spend={spend:,.0f} Orders={orders:.0f}"
+                if cpo:
+                    line += f" CPO={cpo:.0f}"
+            else:
+                line += "الشيت مش متحدث"
+
+            if not report["complete"]:
+                missing = [m["label"] for m in report["missing"]]
+                line += f" | ناقص: {', '.join(missing)}"
+
+            parts.append(line)
+        except Exception as e:
+            parts.append(f"⚠️ {team_name}: خطأ ({e})")
+
+    try:
+        await loading.edit_text("\n".join(parts))
+    except Exception:
+        await send_long_message(context, msg.chat_id, "\n".join(parts))
+
+
+async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force send morning reminder."""
+    if not is_owner(update.message.from_user.id):
+        await update.message.reply_text("⚠️ الأمر ده للمالك بس.")
+        return
+    await update.message.reply_text("⏳ جاري إرسال تذكير الصبح...")
+    await send_morning_prereminder(context)
+    await update.message.reply_text("✅ تم إرسال التذكير.")
+
+
+async def cmd_afternoon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force send afternoon questions."""
+    if not is_owner(update.message.from_user.id):
+        await update.message.reply_text("⚠️ الأمر ده للمالك بس.")
+        return
+    await update.message.reply_text("⏳ جاري إرسال أسئلة المساء...")
+    await send_afternoon_questions(context)
+    await update.message.reply_text("✅ تم الإرسال.")
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate and show daily report."""
+    loading = await update.message.reply_text("⏳ جاري إعداد التقرير...")
+    report = await analyzer.generate_smart_daily_report()
+    if report:
+        try:
+            await loading.edit_text(report)
+        except Exception:
+            await send_long_message(context, update.message.chat_id, report)
+    else:
+        await loading.edit_text("⚠️ مفيش بيانات كافية للتقرير.")
+
+
+async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show team details - let user pick a team."""
+    keyboard = []
+    row = []
+    for team_name in analyzer.TEAM_INFO:
+        leader = analyzer.get_leader(team_name)
+        row.append(InlineKeyboardButton(
+            f"{team_name} ({leader})",
+            callback_data=f"tm_{team_name[:8]}",
+        ))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    await update.message.reply_text(
+        "اختار الفريق:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def callback_team_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show detailed team info."""
+    query = update.callback_query
+    await query.answer()
+
+    team_prefix = query.data.replace("tm_", "")
+    team_name = None
+    for tn in analyzer.TEAM_INFO:
+        if tn.startswith(team_prefix) or tn[:8] == team_prefix:
+            team_name = tn
+            break
+    if not team_name:
+        await query.edit_message_text("⚠️ مش لاقي الفريق.")
+        return
+
+    await query.edit_message_text(f"⏳ جاري تحميل بيانات {team_name}...")
+
+    ctx = await analyzer.build_team_context(team_name)
+    text = analyzer.format_context_for_prompt(ctx)
+
+    # Truncate if too long
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n... (مقطوع)"
+
+    try:
+        await query.edit_message_text(text)
+    except Exception:
+        await send_long_message(context, query.message.chat_id, text)
+
+
+async def cmd_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send alert to selected teams. Usage: /alert [message]"""
+    if not is_owner(update.message.from_user.id):
+        await update.message.reply_text("⚠️ الأمر ده للمالك بس.")
+        return
+
+    text = update.message.text.replace("/alert", "").strip()
+    if not text:
+        await update.message.reply_text("استخدام: /alert [الرسالة]\nأو /broadcast [الرسالة] لكل الفرق")
+        return
+
+    # Send to all teams
+    sent = 0
+    for gid in TEAMS:
+        try:
+            await context.bot.send_message(chat_id=gid, text=text)
+            sent += 1
+        except Exception as e:
+            logger.error("Alert send failed to %d: %s", gid, e)
+    await update.message.reply_text(f"✅ تم الإرسال لـ {sent} فريق.")
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast to all teams."""
+    if not is_owner(update.message.from_user.id):
+        await update.message.reply_text("⚠️ الأمر ده للمالك بس.")
+        return
+
+    text = update.message.text.replace("/broadcast", "").strip()
+    if not text:
+        await update.message.reply_text("استخدام: /broadcast [الرسالة]")
+        return
+
+    sent = 0
+    for gid in TEAMS:
+        try:
+            await context.bot.send_message(chat_id=gid, text=text)
+            sent += 1
+        except Exception as e:
+            logger.error("Broadcast failed to %d: %s", gid, e)
+    await update.message.reply_text(f"✅ تم البث لـ {sent} فريق.")
+
+
+async def cmd_compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Compare team screenshots vs sheet."""
+    chat_id = update.message.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        await update.message.reply_text("⚠️ الأمر ده لازم يكون في جروب فريق.")
+        return
+
+    loading = await update.message.reply_text("⏳ جاري المقارنة...")
+
+    tracking = await analyzer.get_missing_for_team(team_name)
+    rows = await analyzer.fetch_team_sheet(team_name)
+    today = analyzer.get_team_sheet_today(rows) if rows else None
+
+    parts = [f"📊 مقارنة {team_name}:\n"]
+
+    if today:
+        parts.append("بيانات الشيت:")
+        parts.append(analyzer.format_team_sheet_data(today))
+    else:
+        parts.append("الشيت مش متحدث النهاردة.")
+
+    parts.append("")
+    if tracking["complete"]:
+        parts.append("✅ كل الصور المطلوبة اتبعتت.")
+    else:
+        parts.append("ناقص:")
+        for m in tracking["missing"]:
+            parts.append(f"  - {m['label']}")
+
+    try:
+        await loading.edit_text("\n".join(parts))
+    except Exception:
+        await send_long_message(context, chat_id, "\n".join(parts))
+
+
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle pause for a team."""
+    if not is_owner(update.message.from_user.id):
+        await update.message.reply_text("⚠️ الأمر ده للمالك بس.")
+        return
+
+    chat_id = update.message.chat_id
+    # If in a team group, toggle that team
+    if chat_id in TEAMS:
+        if chat_id in paused_teams:
+            paused_teams.discard(chat_id)
+            await update.message.reply_text(f"▶️ تم تشغيل {TEAMS[chat_id]}")
+        else:
+            paused_teams.add(chat_id)
+            await update.message.reply_text(f"⏸️ تم إيقاف {TEAMS[chat_id]}")
+        return
+
+    # If in private chat, show team selection
+    keyboard = []
+    row = []
+    for gid, tn in TEAMS.items():
+        status = "⏸️" if gid in paused_teams else "▶️"
+        row.append(InlineKeyboardButton(
+            f"{status} {tn}",
+            callback_data=f"ps_{gid}",
+        ))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+
+    await update.message.reply_text(
+        "اختار الفريق:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def callback_pause_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle pause from button."""
+    query = update.callback_query
+    await query.answer()
+
+    gid = int(query.data.replace("ps_", ""))
+    team_name = TEAMS.get(gid, "?")
+
+    if gid in paused_teams:
+        paused_teams.discard(gid)
+        await query.edit_message_text(f"▶️ تم تشغيل {team_name}")
+    else:
+        paused_teams.add(gid)
+        await query.edit_message_text(f"⏸️ تم إيقاف {team_name}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SCHEDULED JOBS
+# ══════════════════════════════════════════════════════════════════════
+
+async def send_morning_prereminder(context: ContextTypes.DEFAULT_TYPE):
+    """10:30 AM - Friendly morning reminder."""
+    for gid, team_name in TEAMS.items():
+        if gid in paused_teams:
+            continue
+        leader = analyzer.get_leader(team_name)
+        try:
+            await context.bot.send_message(
+                chat_id=gid,
+                text=(
+                    f"صباح الخير يا {leader}! ☀️\n"
+                    f"فاكرين تقرير الصبح؟\n"
+                    f"الديدلاين الساعة 11:00 ⏰"
+                ),
+            )
+        except Exception as e:
+            logger.error("Pre-reminder failed for %s: %s", team_name, e)
+        await asyncio.sleep(0.5)
+
+
+async def send_smart_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """11:00 AM - Deadline reached. Start tracking. Schedule follow-ups."""
+    for gid, team_name in TEAMS.items():
+        if gid in paused_teams:
+            continue
+        leader = analyzer.get_leader(team_name)
+        try:
+            missing = await analyzer.get_missing_for_team(team_name, "morning")
+            if not missing["complete"]:
+                missing_labels = [m["label"] for m in missing["missing"]]
+                await context.bot.send_message(
+                    chat_id=gid,
+                    text=(
+                        f"⏰ يا {leader}، الساعة 11 والمطلوب:\n"
+                        + "\n".join(f"  - {ml}" for ml in missing_labels)
+                        + "\n\nابعتيهم دلوقتي لو سمحتي 🙏"
+                    ),
+                )
+        except Exception as e:
+            logger.error("Morning reminder failed for %s: %s", team_name, e)
+        await asyncio.sleep(0.5)
+
+    # Schedule follow-up reminders
+    job_queue = context.job_queue
+    job_queue.run_once(_reminder_followup_1, when=timedelta(minutes=15),
+                       name="followup_1")
+    job_queue.run_once(_reminder_followup_2, when=timedelta(minutes=30),
+                       name="followup_2")
+    job_queue.run_once(_reminder_followup_3, when=timedelta(minutes=45),
+                       name="followup_3")
+
+
+async def _reminder_followup_1(context: ContextTypes.DEFAULT_TYPE):
+    """11:15 AM - First follow-up: specific missing items."""
+    await _send_missing_reminder(context, "⏰ تذكير أول:")
+
+
+async def _reminder_followup_2(context: ContextTypes.DEFAULT_TYPE):
+    """11:30 AM - Second follow-up: stronger."""
+    await _send_missing_reminder(context, "⚠️ تذكير تاني:")
+
+
+async def _reminder_followup_3(context: ContextTypes.DEFAULT_TYPE):
+    """11:45 AM - Last reminder."""
+    await _send_missing_reminder(context, "🔴 تذكير أخير:")
+
+
+async def _send_missing_reminder(context: ContextTypes.DEFAULT_TYPE, prefix: str):
+    """Send reminders only to teams that still have missing items."""
+    for gid, team_name in TEAMS.items():
+        if gid in paused_teams:
+            continue
+        try:
+            missing = await analyzer.get_missing_for_team(team_name, "morning")
+            if missing["complete"]:
+                continue
+            leader = analyzer.get_leader(team_name)
+            missing_labels = [m["label"] for m in missing["missing"]]
+            await context.bot.send_message(
+                chat_id=gid,
+                text=(
+                    f"{prefix}\n"
+                    f"يا {leader}، لسه ناقص:\n"
+                    + "\n".join(f"  - {ml}" for ml in missing_labels)
+                ),
+            )
+        except Exception as e:
+            logger.error("Reminder failed for %s: %s", team_name, e)
+        await asyncio.sleep(0.3)
+
+
+async def final_morning_check(context: ContextTypes.DEFAULT_TYPE):
+    """
+    12:00 PM - Final check:
+    1. Read tracking for each team
+    2. Read each team's Google Sheet
+    3. Trigger master sheet update
+    4. Send individual team reports to OWNER
+    5. Wait for owner decision on each team
+    """
+    # Trigger master sheet update
+    await analyzer.trigger_master_update()
+
+    # Build and send reports for each team to owner
+    for team_name in analyzer.TEAM_INFO:
+        gid = TEAM_GIDS.get(team_name)
+        if not gid or gid in paused_teams:
+            continue
+
+        try:
+            report = await analyzer.build_owner_team_report(team_name)
+
+            # Only send to owner if there are missing items or issues
+            if not report["complete"] or report["cpo_status"] == "red":
+                text = _format_owner_team_report(team_name, gid, report)
+                keyboard = _build_owner_decision_keyboard(gid)
+                await context.bot.send_message(
+                    chat_id=OWNER_CHAT_ID,
+                    text=text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            else:
+                # Team is complete - just notify briefly
+                leader = report["leader"]
+                sd = report.get("sheet_data", {})
+                cpo = sd.get("cpo")
+                cpo_str = f" CPO={cpo:.0f}" if cpo else ""
+                await context.bot.send_message(
+                    chat_id=OWNER_CHAT_ID,
+                    text=f"✅ {team_name} ({leader}): كل حاجة تمام.{cpo_str}",
+                )
+        except Exception as e:
+            logger.error("Final check failed for %s: %s", team_name, e)
+            await context.bot.send_message(
+                chat_id=OWNER_CHAT_ID,
+                text=f"⚠️ {team_name}: خطأ في المراجعة - {e}",
+            )
+        await asyncio.sleep(0.5)
 
 
 async def proactive_check(context: ContextTypes.DEFAULT_TYPE):
-    """1:30 PM Egypt - proactive sheet check after master update."""
-    from analyzer import proactive_sheet_check
-    alerts = await proactive_sheet_check()
+    """1:30 PM - Proactive check after master update."""
+    alerts = await analyzer.proactive_sheet_check()
     if not alerts:
-        await notify_owner(context, "✅ مراجعة الشيتات: كل حاجة تمام!")
         return
 
-    lines = ["🔍 مراجعة تلقائية للشيتات:\n"]
+    # Group alerts by severity
     critical = [a for a in alerts if a["severity"] == "critical"]
     warnings = [a for a in alerts if a["severity"] == "warning"]
-    info = [a for a in alerts if a["severity"] == "info"]
 
-    if critical:
-        lines.append("🚨 مشاكل حرجة:")
+    if critical or warnings:
+        parts = ["🔍 نتائج المراجعة الاستباقية:\n"]
         for a in critical:
-            lines.append(f"  {a['msg']}")
-        lines.append("")
-
-    if warnings:
-        lines.append("⚠️ تحذيرات:")
+            parts.append(f"🚨 {a['msg']}")
         for a in warnings:
-            lines.append(f"  {a['msg']}")
-        lines.append("")
+            parts.append(f"⚠️ {a['msg']}")
 
-    if info:
-        lines.append("📋 ملاحظات:")
-        for a in info[:5]:  # Max 5
-            lines.append(f"  {a['msg']}")
-
-    await notify_owner(context, "\n".join(lines))
-
-    # Also alert team leaders with critical issues
-    for a in critical:
-        team = a["team"]
-        gid = next((g for g, n in TEAMS.items() if n == team), None)
-        if gid and gid not in paused_teams:
-            await send_to_group(context, gid,
-                f"⚠️ يا {a['leader']}، {a['msg']}\nمحتاج أفهم إيه اللي حصل؟")
+        try:
+            await send_long_message(context, OWNER_CHAT_ID, "\n".join(parts))
+        except Exception as e:
+            logger.error("Proactive check send error: %s", e)
 
 
 async def smart_daily_report(context: ContextTypes.DEFAULT_TYPE):
-    """2:00 PM Egypt - AI-powered daily report to owner."""
-    from analyzer import generate_smart_daily_report, trigger_master_update
-
-    # First trigger master sheet update
-    updated = await trigger_master_update()
-    if updated:
-        logger.info("Master sheet updated before daily report")
-
-    # Generate smart report
-    report = await generate_smart_daily_report()
+    """2:00 PM - Smart daily report to owner."""
+    report = await analyzer.generate_smart_daily_report()
     if report:
-        await notify_owner(context, f"📊 التقرير اليومي الذكي:\n\n{report}")
-    else:
-        await notify_owner(context, "⚠️ مش قادر أعمل التقرير - مفيش بيانات كافية")
+        try:
+            await send_long_message(
+                context, OWNER_CHAT_ID,
+                f"📊 التقرير اليومي الذكي:\n\n{report}",
+            )
+        except Exception as e:
+            logger.error("Daily report send error: %s", e)
+
+
+async def send_afternoon_questions(context: ContextTypes.DEFAULT_TYPE):
+    """4:00 PM - Send afternoon questions to each team."""
+    for gid, team_name in TEAMS.items():
+        if gid in paused_teams:
+            continue
+        leader = analyzer.get_leader(team_name)
+        try:
+            await context.bot.send_message(
+                chat_id=gid,
+                text=(
+                    f"مساء الخير يا {leader}! 🌤️\n"
+                    f"وقت تقرير الساعة 4:\n"
+                    f"1️⃣ أداء الإعلانات من الصبح لحد دلوقتي\n"
+                    f"2️⃣ عدد الرسائل مقابل عدد الطلبات (فيسبوك)\n"
+                    f"3️⃣ صرفتي كام على الفيسبوك؟\n"
+                    f"4️⃣ عدد الليدز/المبيعات على التيك توك\n"
+                    f"5️⃣ صرفتي كام على التيك توك؟\n"
+                    f"6️⃣ وضع التوصيل النهاردة\n"
+                    f"7️⃣ أي ملاحظات أو مشاكل؟"
+                ),
+            )
+        except Exception as e:
+            logger.error("Afternoon questions failed for %s: %s", team_name, e)
+        await asyncio.sleep(0.5)
 
 
 async def daily_reset(context: ContextTypes.DEFAULT_TYPE):
-    """Midnight Egypt - reset daily tracking."""
-    morning_photos.clear()
-    afternoon_photos.clear()
-    morning_types.clear()
-    afternoon_types.clear()
-    _save_tracking()  # Save empty state
-    from analyzer import reset_conversation_memory
-    reset_conversation_memory()
-    logger.info("Daily tracking reset (Egypt midnight)")
-
-
-async def check_weekly_and_salary(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Monthly cycle: 26th to 25th
-    Week 1 (day 26): weekly report
-    Week 2 (day 2-3): weekly report
-    Week 3 (day 9-10): weekly report
-    Week 4 (day 16-17): NO weekly report
-    Day 24: salary reminder
-    Day 25: salary sheet request
-    """
-    today = now_egypt()
-    day = today.day
-
-    # Salary
-    if day == 24:
-        await send_to_all(context, SALARY_REMINDER_MSG)
-        await notify_owner(context, "📢 تم إرسال تذكير الرواتب (يوم 24)")
-        logger.info("Salary reminder sent (day 24)")
-        return
-    if day == 25:
-        await send_to_all(context, SALARY_REQUEST_MSG)
-        schedule_report_followups(context.job_queue, "salary")
-        await notify_owner(context, "📋 تم إرسال طلب شيت الرواتب (يوم 25)")
-        logger.info("Salary request sent (day 25)")
-        return
-
-    # Weekly reports: first 3 weeks of the cycle (26→25)
-    # Week 1: day 26, Week 2: day 2-3, Week 3: day 9-10
-    # Week 4 (day 16-17): skip - salary week
-    weekly_days = [26, 2, 9]  # Only first 3 weeks
-    if day in weekly_days:
-        await send_to_all(context, WEEKLY_MSG)
-        await notify_owner(context, f"📊 تم إرسال طلب التقرير الأسبوعي (يوم {day})")
-        logger.info("Weekly report request sent (day %d)", day)
+    """12:05 AM - Daily reset."""
+    analyzer.reset_conversation_memory()
+    logger.info("Daily reset completed at %s", now_egypt())
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Commands
+# CALLBACK QUERY ROUTER
 # ══════════════════════════════════════════════════════════════════════
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "مرحباً! أنا EcoTeam Agent Bot 🤖\n"
-        "مدير تسويق رقمي يعمل 24/7\n"
-        "جاهز أساعدك في إدارة الفرق ومراجعة الأداء."
-    )
 
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    await update.message.reply_text(
-        "📋 الأوامر المتاحة:\n\n"
-        "⏰ تلقائي:\n"
-        "• الساعة 11 صباحاً - تذكير الصبح\n"
-        "• الساعة 4 عصراً - تذكير العصر\n"
-        "• الساعة 12 ظهراً - ملخص يومي\n"
-        "• يوم 26, 2, 9 - تقرير أسبوعي\n"
-        "• يوم 24 - تذكير رواتب | يوم 25 - طلب شيت الرواتب\n\n"
-        "📱 أوامر يدوية:\n"
-        "/morning - تذكير الصبح\n"
-        "/afternoon - تذكير العصر\n"
-        "/status - حالة الفرق\n"
-        "/compare - مقارنة بالأرقام الحقيقية\n"
-        "/alert - تنبيه لفريق\n"
-        "/broadcast - رسالة لكل الفرق\n"
-        "/team - حالة فريق\n"
-        "/pause - إيقاف تذكيرات\n"
-        "/weekly - طلب التقرير الأسبوعي\n"
-        "/report - ملخص يومي\n\n"
-        "🤖 تلقائي:\n"
-        "• تحليل screenshots بالذكاء الاصطناعي\n"
-        "• مراجعة البادجيت ومقارنة الأرقام\n"
-        "• تحليل فيديوهات وصور الإعلانات\n"
-        "• رد ذكي على أسئلة التيم ليدر"
-    )
-
-
-async def morning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    morning_photos.clear()
-    await send_to_all(context, MORNING_MSG)
-    schedule_report_followups(context, "morning")
-    await update.message.reply_text("✅ تم إرسال تذكير الصبح لكل الفرق.")
-
-
-async def afternoon_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    afternoon_photos.clear()
-    await send_to_all(context, AFTERNOON_MSG)
-    schedule_report_followups(context, "afternoon")
-    await update.message.reply_text("✅ تم إرسال تذكير العصر لكل الفرق.")
-
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-
-    # Step 1: Show working indicator
-    loading_msg = await update.message.reply_text("⏳ جاري مراجعة كل الشيتات والبيانات...")
-
-    from analyzer import get_leader, fetch_team_sheet, get_team_sheet_today, _safe_num
-
-    today = now_egypt().strftime("%d/%m")
-    t = now_egypt().strftime("%I:%M%p")
-
-    done_list = []
-    partial_list = []
-    missing_list = []
-
-    # Step 2: Check ALL sources for each team
-    for gid, name in TEAMS.items():
-        leader = get_leader(name)
-        paused = " ⏸" if gid in paused_teams else ""
-
-        # Source 1: Photo tracking (what screenshots were sent)
-        m_received = get_received_categories(gid, "morning")
-        m_missing = get_missing_categories(gid, "morning")
-
-        # Source 2: Team sheet (PRIMARY source of truth)
-        sheet_updated = False
-        sheet_status = ""
-        try:
-            rows = await fetch_team_sheet(name)
-            logger.info("/status: %s - fetched %d rows", name, len(rows) if rows else 0)
-            today_row = get_team_sheet_today(rows) if rows else None
-            if today_row:
-                sheet_updated = True
-                spend = _safe_num(today_row.get("Spend", ""))
-                orders = _safe_num(today_row.get("New Orders", ""))
-                cpo = _safe_num(today_row.get("CPO", ""))
-                date = today_row.get("Date", "?")
-                logger.info("/status: %s - today=%s spend=%s orders=%s", name, date, spend, orders)
-                sheet_status = f"\n     📋 [{date}] Spend:{spend:,.0f} | Orders:{orders:.0f}"
-                if cpo and cpo > 0:
-                    emoji = "🟢" if cpo <= 150 else "🟡" if cpo <= 180 else "🔴"
-                    sheet_status += f" | CPO:{cpo:.0f}{emoji}"
-            else:
-                logger.info("/status: %s - no today row found", name)
-                sheet_status = "\n     📋 الشيت لسه مش متحدث"
-        except Exception as e:
-            logger.error("/status: %s - sheet error: %s", name, e)
-            sheet_status = "\n     📋 ⚠️ مش قادر أقرأ الشيت"
-
-        # Determine status: use BOTH sources
-        if not m_missing:
-            # All 3 categories received via photos
-            done_list.append(f"  ✅ {name} ({leader}){sheet_status}{paused}")
-        elif sheet_updated and m_received:
-            # Sheet updated + some photos
-            done_count = 3 - len(m_missing)
-            done_list.append(f"  ✅ {name} ({leader}) [{done_count}/3 صور]{sheet_status}{paused}")
-        elif sheet_updated and not m_received:
-            # Sheet updated but no photos tracked (maybe sent before deploy)
-            partial_list.append(f"  🟡 {name} ({leader}) - الشيت متحدث{sheet_status}{paused}")
-        elif m_received:
-            # Some photos but sheet not updated
-            received_short = ", ".join(m_received)
-            partial_list.append(f"  🟡 {name} ({leader}) - وصل: {received_short}{paused}")
-        else:
-            # Nothing at all
-            missing_list.append(f"  ❌ {name} ({leader}){sheet_status}{paused}")
-
-    # Step 3: Build verified response
-    lines = [f"📊 حالة الفرق  {today} {t}\n"]
-
-    if done_list:
-        lines.append("✅ مكتمل:")
-        lines.extend(done_list)
-        lines.append("")
-    if partial_list:
-        lines.append("🟡 ناقص:")
-        lines.extend(partial_list)
-        lines.append("")
-    if missing_list:
-        lines.append("❌ لم يبدأ:")
-        lines.extend(missing_list)
-        lines.append("")
-
-    lines.append(f"الصبح: ✅{len(done_list)} | 🟡{len(partial_list)} | ❌{len(missing_list)}")
-
-    # Replace loading message with actual result
-    await loading_msg.edit_text("\n".join(lines))
-
-
-async def weekly_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    await send_to_all(context, WEEKLY_MSG)
-    await update.message.reply_text("✅ تم إرسال طلب التقرير الأسبوعي.")
-
-
-async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    await update.message.reply_text("⏳ جاري جمع البيانات من كل الشيتات وتحليلها...")
-    await daily_noon_report(context)
-    await update.message.reply_text("✅ تم إرسال الملخص اليومي.")
-
-
-# ══════════════════════════════════════════════════════════════════════
-# /compare - Real numbers comparison from Master Sheet
-# ══════════════════════════════════════════════════════════════════════
-async def compare_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return ConversationHandler.END
-    await update.message.reply_text("اختار الفريق للمقارنة:", reply_markup=teams_keyboard())
-    return COMPARE_PICK
-
-
-async def compare_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route all callback queries based on prefix."""
     query = update.callback_query
-    await query.answer()
-    gid = int(query.data.replace("team_", ""))
-    name = team_name(gid)
+    if not query or not query.data:
+        return
 
-    await query.edit_message_text(f"⏳ جاري مراجعة شيت {name} + الشيت المجمع + الصور...")
-
-    from analyzer import fetch_master_data, get_team_today_data, get_team_history, get_leader
-
-    leader = get_leader(name)
-    all_data = await fetch_master_data()
-    today_data = get_team_today_data(all_data, name)
-    history = get_team_history(all_data, name, days=5)
-
-    if not today_data:
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"❌ مش لاقي بيانات لفريق {name} في الشيت"
-        )
-        return ConversationHandler.END
-
-    from analyzer import _safe_num
-    spend = _safe_num(today_data.get("Spend اليوم", 0)) or 0
-    orders = _safe_num(today_data.get("Orders اليوم", 0)) or 0
-    cpo = today_data.get("CPO اليوم", "-")
-    action_today = today_data.get("\U0001f6a6 اليوم", "")
-    spend_y = today_data.get("Spend أمس", "-")
-    delivered = _safe_num(today_data.get("Delivered", 0)) or 0
-    cancel = _safe_num(today_data.get("Cancel", 0)) or 0
-    hold = _safe_num(today_data.get("Hold", 0)) or 0
-    cancel_pct = today_data.get("Cancel%", "0%")
-    cpa = today_data.get("CPA الحقيقي", "-")
-    action_yest = today_data.get("\U0001f6a6 أمس", "")
-
-    m = morning_photos.get(gid, 0)
-    a = afternoon_photos.get(gid, 0)
-
-    lines = [
-        f"╔══════════════════════════════╗",
-        f"║  📊 {name} ({leader})",
-        f"║  📅 {today_data.get('التاريخ', '?')}",
-        f"╚══════════════════════════════╝",
-        "",
-        "┌─── 📈 بيانات اليوم ───┐",
-        f"│  💰 Spend:    {spend:>8,} جنيه",
-        f"│  📦 Orders:   {orders:>8}",
-        f"│  🏷️ CPO:      {cpo:>8}",
-        f"│  🚦 القرار:   {action_today}",
-        "└──────────────────────────┘",
-        "",
-        "┌─── 📉 بيانات أمس ───┐",
-        f"│  💰 Spend أمس: {spend_y:>7}",
-        f"│  ✅ Delivered:  {delivered:>7}",
-        f"│  ❌ Cancel:     {cancel:>7} ({cancel_pct})",
-        f"│  ⏳ Hold:       {hold:>7}",
-        f"│  🏷️ CPA:       {cpa:>7}",
-        f"│  🚦 القرار:    {action_yest}",
-        "└──────────────────────────┘",
-    ]
-
-    # Trend
-    if len(history) >= 2:
-        lines.append("")
-        lines.append("┌─── 📊 آخر 5 أيام ───┐")
-        for row in history[-5:]:
-            d = row.get("التاريخ", "?")
-            s = row.get("Spend اليوم", 0)
-            o = row.get("Orders اليوم", 0)
-            c = row.get("CPO اليوم", "-")
-            act = row.get("\U0001f6a6 اليوم", "")
-            s_fmt = f"{s:,}" if isinstance(s, (int, float)) and s > 0 else "-"
-            lines.append(f"│ {d} │ 💰{s_fmt:>7} │ 📦{o:>3} │ CPO:{c:>4} {act}")
-        lines.append("└──────────────────────────┘")
-
-    # Screenshots
-    lines.append("")
-    m_icon = "✅" if m >= MORNING_REQUIRED else f"{'🟡' if m > 0 else '❌'} {m}/{MORNING_REQUIRED}"
-    a_icon = "✅" if a >= AFTERNOON_REQUIRED else f"{'🟡' if a > 0 else '❌'} {a}/{AFTERNOON_REQUIRED}"
-    lines.append(f"📸 صبح: {m_icon}  |  عصر: {a_icon}")
-
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text="\n".join(lines)
-    )
-    return ConversationHandler.END
-
-
-# ══════════════════════════════════════════════════════════════════════
-# /alert, /broadcast, /team, /pause (same as before)
-# ══════════════════════════════════════════════════════════════════════
-def alert_teams_keyboard(selected: set) -> InlineKeyboardMarkup:
-    """Build multi-select keyboard for /alert."""
-    buttons = []
-    buttons.append([InlineKeyboardButton("📢 كل الفرق", callback_data="alert_all")])
-    for gid, name in TEAMS.items():
-        check = "✅" if gid in selected else "⬜"
-        buttons.append([InlineKeyboardButton(f"{check} {name}", callback_data=f"alert_toggle_{gid}")])
-    if selected:
-        buttons.append([InlineKeyboardButton(f"➡️ متابعة ({len(selected)} فريق)", callback_data="alert_done")])
-    return InlineKeyboardMarkup(buttons)
-
-
-async def alert_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return ConversationHandler.END
-    context.user_data["alert_selected"] = set()
-    await update.message.reply_text(
-        "اختار الفرق (اضغط على أكتر من فريق):",
-        reply_markup=alert_teams_keyboard(set()),
-    )
-    return ALERT_PICK_TEAM
-
-
-async def alert_pick_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
     data = query.data
 
-    if data == "alert_all":
-        context.user_data["alert_selected"] = set(TEAMS.keys())
-        names = "كل الفرق"
-        await query.edit_message_text(f"📢 {names}\n\n✏️ اكتب الرسالة:")
-        return ALERT_TYPE_MSG
-
-    if data == "alert_done":
-        selected = context.user_data.get("alert_selected", set())
-        if not selected:
-            await query.answer("اختار فريق واحد على الأقل")
-            return ALERT_PICK_TEAM
-        names = ", ".join(team_name(g) for g in selected)
-        await query.edit_message_text(f"📤 الفرق: {names}\n\n✏️ اكتب الرسالة:")
-        return ALERT_TYPE_MSG
-
-    if data.startswith("alert_toggle_"):
-        gid = int(data.replace("alert_toggle_", ""))
-        selected = context.user_data.get("alert_selected", set())
-        if gid in selected:
-            selected.discard(gid)
-        else:
-            selected.add(gid)
-        context.user_data["alert_selected"] = selected
-        await query.edit_message_reply_markup(reply_markup=alert_teams_keyboard(selected))
-        return ALERT_PICK_TEAM
-
-
-async def alert_type_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["alert_msg"] = update.message.text
-    selected = context.user_data.get("alert_selected", set())
-    names = ", ".join(team_name(g) for g in selected)
-    await update.message.reply_text(
-        f"📤 إرسال لـ {len(selected)} فريق:\n{names}\n\n{update.message.text}\n\nتأكيد؟",
-        reply_markup=confirm_keyboard(),
-    )
-    return ALERT_CONFIRM
-
-
-async def alert_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "confirm_yes":
-        selected = context.user_data.get("alert_selected", set())
-        msg = context.user_data["alert_msg"]
-        sent = 0
-        for gid in selected:
-            await send_to_group(context, gid, msg)
-            sent += 1
-        await query.edit_message_text(f"✅ تم الإرسال لـ {sent} فريق")
+    if data.startswith("it_"):
+        await callback_image_type(update, context)
+    elif data.startswith("ac_"):
+        await callback_account_count(update, context)
+    elif data.startswith("cf_"):
+        await callback_confirmation(update, context)
+    elif data.startswith("od_"):
+        await callback_owner_decision(update, context)
+    elif data.startswith("tm_"):
+        await callback_team_detail(update, context)
+    elif data.startswith("ps_"):
+        await callback_pause_toggle(update, context)
     else:
-        await query.edit_message_text("❌ تم الإلغاء")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return ConversationHandler.END
-    await update.message.reply_text("✏️ اكتب الرسالة:")
-    return BROADCAST_TYPE_MSG
-
-
-async def broadcast_type_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["broadcast_msg"] = update.message.text
-    await update.message.reply_text(
-        f"📤 إرسال لـ {len(TEAMS)} جروبات:\n\n{update.message.text}\n\nتأكيد؟",
-        reply_markup=confirm_keyboard(),
-    )
-    return BROADCAST_CONFIRM
-
-
-async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "confirm_yes":
-        await send_to_all(context, context.user_data["broadcast_msg"])
-        await query.edit_message_text(f"✅ تم الإرسال")
-    else:
-        await query.edit_message_text("❌ تم الإلغاء")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def team_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return ConversationHandler.END
-    await update.message.reply_text("اختار الفريق:", reply_markup=teams_keyboard())
-    return TEAM_PICK
-
-
-async def team_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    gid = int(query.data.replace("team_", ""))
-    name = team_name(gid)
-    from analyzer import get_leader
-    leader = get_leader(name)
-    m = morning_photos.get(gid, 0)
-    a = afternoon_photos.get(gid, 0)
-    m_status = "✅" if m >= MORNING_REQUIRED else f"⏳ {m}/{MORNING_REQUIRED}"
-    a_status = "✅" if a >= AFTERNOON_REQUIRED else f"⏳ {a}/{AFTERNOON_REQUIRED}"
-    paused = "\n⏸ التذكيرات متوقفة" if gid in paused_teams else ""
-    await query.edit_message_text(
-        f"📋 {name} ({leader})\n━━━━━━━━━━━━━\n"
-        f"تقرير الصبح: {m_status}\nتقرير العصر: {a_status}{paused}"
-    )
-    return ConversationHandler.END
-
-
-async def pause_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return ConversationHandler.END
-    await update.message.reply_text("اختار الفريق:", reply_markup=teams_keyboard())
-    return PAUSE_PICK
-
-
-async def pause_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    gid = int(query.data.replace("team_", ""))
-    name = team_name(gid)
-    if gid in paused_teams:
-        paused_teams.discard(gid)
-        await query.edit_message_text(f"▶️ تم تشغيل التذكيرات لـ {name}")
-    else:
-        paused_teams.add(gid)
-        await query.edit_message_text(f"⏸ تم إيقاف التذكيرات لـ {name}")
-    return ConversationHandler.END
+        logger.warning("Unknown callback data: %s", data)
+        await query.answer("⚠️")
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Photo handler: classify first, then act accordingly
+# ERROR HANDLER
 # ══════════════════════════════════════════════════════════════════════
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = update.effective_chat.id
-    if gid not in TEAMS:
-        return
 
-    # Owner sends photo in group → bot stays silent (just observe)
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id == OWNER_CHAT_ID:
-        return
-
-    from analyzer import (
-        analyze_screenshot, smart_analysis,
-        generate_quick_summary, get_leader,
-        handle_non_report_image,
-        REPORT_IMAGE_TYPES,
-    )
-
-    name = team_name(gid)
-    leader = get_leader(name)
-    hour = now_egypt().hour
-
-    # Download the image first
-    try:
-        photo = update.message.photo[-1]
-        file = await context.bot.get_file(photo.file_id)
-        image_bytes = bytes(await file.download_as_bytearray())
-    except Exception as e:
-        logger.error("Photo download error (%s): %s", name, e)
-        return
-
-    # Step 1: Classify + extract (analyze_screenshot now classifies first)
-    report_type = "morning" if hour < 16 else "afternoon"
-    try:
-        result = await analyze_screenshot(image_bytes, name, report_type)
-    except Exception as e:
-        logger.error("Photo analysis error (%s): %s", name, e)
-        return
-
-    img_type = result.get("image_type", "other")
-    low_confidence = result.get("_low_confidence", False)
-
-    # Step 1.5: If bot isn't sure about image type, ask!
-    if low_confidence and img_type != "other":
-        from analyzer import get_leader as _gl, IMAGE_TYPES
-        _leader = _gl(name)
-        type_label = IMAGE_TYPES.get(img_type, img_type)
-        ask_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ صح كده", callback_data=f"imgtype_yes_{img_type}")],
-            [InlineKeyboardButton("❌ لا، دي حاجة تانية", callback_data=f"imgtype_no_{img_type}")],
-        ])
-        await update.message.reply_text(
-            f"🤔 يا {_leader}، أنا شايف إن الصورة دي: **{type_label}**\nصح كده؟",
-            reply_markup=ask_keyboard,
-            parse_mode="Markdown",
-        )
-        # Store image bytes for later processing after confirmation
-        context.chat_data["pending_image"] = image_bytes
-        context.chat_data["pending_result"] = result
-        context.chat_data["pending_report_type"] = report_type
-        return
-
-    # Step 2a: If sheet read failed for order_sheet, handle specially
-    if result.get("_sheet_read_failed"):
-        # Try to analyze with smart_analysis using whatever data we have
-        hour_now = now_egypt().hour
-        if hour_now < 16:
-            count = morning_photos.get(gid, 0) + 1
-            morning_photos[gid] = count
-        else:
-            count = afternoon_photos.get(gid, 0) + 1
-            afternoon_photos[gid] = count
-        period = "الصبح" if hour_now < 16 else "العصر"
-        required = MORNING_REQUIRED if hour_now < 16 else AFTERNOON_REQUIRED
-
-        from analyzer import smart_analysis as _sa
-        analysis = await _sa(name, result, report_type, image_bytes)
-        if analysis:
-            await update.message.reply_text(
-                f"📸 تقرير {period}: ({count}/{required})\n\n{analysis}",
-                reply_markup=feedback_keyboard(),
-            )
-            _last_bot_analysis[gid] = analysis
-        else:
-            await update.message.reply_text(f"📸 تقرير {period}: ({count}/{required})\n📋 تم استلام صورة الشيت")
-        return
-
-    # Step 2: Handle based on image type
-    if img_type not in REPORT_IMAGE_TYPES:
-        # Track payment images as "budget" category even though not a "report"
-        pay_category = REPORT_CATEGORY_MAP.get(img_type, "")
-        if pay_category:
-            if hour < 16:
-                count = morning_photos.get(gid, 0) + 1
-                morning_photos[gid] = count
-                if gid not in morning_types:
-                    morning_types[gid] = set()
-                morning_types[gid].add(pay_category)
-                _save_tracking()
-            else:
-                count = afternoon_photos.get(gid, 0) + 1
-                afternoon_photos[gid] = count
-                if gid not in afternoon_types:
-                    afternoon_types[gid] = set()
-                afternoon_types[gid].add(pay_category)
-                _save_tracking()
-
-        try:
-            response = await handle_non_report_image(
-                image_bytes, name, img_type, result.get("description", "")
-            )
-            if response:
-                # Show what was received + what's missing
-                cat_label = REPORT_CATEGORY_LABELS.get(pay_category, "")
-                remaining = get_missing_categories(gid, "morning" if hour < 16 else "afternoon")
-
-                status_line = ""
-                if cat_label:
-                    status_line = f"\n\n📸 سجّلت: {cat_label} ✅"
-                    if remaining:
-                        status_line += f"\nلسه مستني: {' + '.join(remaining)}"
-                    else:
-                        status_line += f"\n✅ التقرير مكتمل!"
-
-                msg = await update.message.reply_text(
-                    f"🤖 {response}{status_line}",
-                    reply_markup=feedback_keyboard(),
-                )
-                _last_bot_analysis[gid] = response
-        except Exception as e:
-            logger.error("Non-report image error (%s): %s", name, e)
-        return
-
-    # Step 3: It's a report screenshot - count it AND track its type
-    category = REPORT_CATEGORY_MAP.get(img_type, "")
-
-    if hour < 16:
-        count = morning_photos.get(gid, 0) + 1
-        morning_photos[gid] = count
-        if category:
-            if gid not in morning_types:
-                morning_types[gid] = set()
-            morning_types[gid].add(category)
-        required = MORNING_REQUIRED
-    else:
-        count = afternoon_photos.get(gid, 0) + 1
-        afternoon_photos[gid] = count
-        if category:
-            if gid not in afternoon_types:
-                afternoon_types[gid] = set()
-            afternoon_types[gid].add(category)
-        required = AFTERNOON_REQUIRED
-
-    _save_tracking()
-    period = "الصبح" if hour < 16 else "العصر"
-
-    # Step 4: Quick summary + smart analysis (one combined message)
-    if "error" not in result:
-        summary = generate_quick_summary(result)
-
-        # Show what category this photo is
-        cat_label = REPORT_CATEGORY_LABELS.get(category, "")
-        remaining = get_missing_categories(gid, "morning" if hour < 16 else "afternoon")
-        remaining_text = f"\nلسه مستني: {' + '.join(remaining)}" if remaining else "\n✅ التقرير مكتمل!"
-
-        analysis = await smart_analysis(name, result, report_type, image_bytes)
-        if analysis:
-            header = f"📸 تقرير {period}: {cat_label} ✅\n{summary}{remaining_text}\n\n"
-            await update.message.reply_text(
-                header + analysis,
-                reply_markup=feedback_keyboard(),
-            )
-            _last_bot_analysis[gid] = analysis
-            if any(w in analysis for w in ["⚠️", "🔴", "🚨", "فرق", "مشكلة"]):
-                await notify_owner(context, f"🔍 تنبيه - {name}:\n{analysis}")
-        else:
-            await update.message.reply_text(
-                f"📸 تقرير {period}: {cat_label} ✅\n{summary}{remaining_text}",
-                reply_markup=feedback_keyboard(),
-            )
-    else:
-        await update.message.reply_text(
-            f"📸 تقرير {period}: {cat_label} ✅{remaining_text}",
-            reply_markup=feedback_keyboard(),
-        )
-
-    # Step 5: Completion message - check by categories not just count
-    missing_cats = get_missing_categories(gid, "morning" if hour < 16 else "afternoon")
-    if not missing_cats:
-        await update.message.reply_text(f"✅ تقرير {period} مكتمل! شكراً {leader} 🎉")
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Video handler: creative analysis
-# ══════════════════════════════════════════════════════════════════════
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    gid = update.effective_chat.id
-    if gid not in TEAMS:
-        return
-    # Owner sends video in group → bot stays silent
-    user_id = update.effective_user.id if update.effective_user else None
-    if user_id == OWNER_CHAT_ID:
-        return
-    from analyzer import analyze_video_creative, get_leader
-    name = team_name(gid)
-    leader = get_leader(name)
-    await update.message.reply_text(f"🎬 جاري تحليل الفيديو... استنى ثواني يا {leader}")
-    try:
-        video = update.message.video or update.message.animation
-        if not video:
-            return
-        file = await context.bot.get_file(video.file_id)
-        video_bytes = await file.download_as_bytearray()
-        thumb_bytes = None
-        if video.thumbnail:
-            tf = await context.bot.get_file(video.thumbnail.file_id)
-            thumb_bytes = bytes(await tf.download_as_bytearray())
-        analysis = await analyze_video_creative(bytes(video_bytes), name, thumb_bytes)
-        if analysis:
-            await update.message.reply_text(
-                f"🤖 {analysis}",
-                reply_markup=feedback_keyboard(),
-            )
-            _last_bot_analysis[gid] = analysis
-        else:
-            await update.message.reply_text("📸 ابعت screenshot من الإعلان عشان أقدر أحلله.")
-    except Exception as e:
-        logger.error("Video analysis error (%s): %s", name, e)
-        await update.message.reply_text("⚠️ حصل مشكلة. جرب تاني.")
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Text reply handler: interactive AI conversation
-# ══════════════════════════════════════════════════════════════════════
-async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """AI responds to replies to the bot. Owner is silent unless bot is invited."""
-    gid = update.effective_chat.id
-    if gid not in TEAMS:
-        return
-    if not update.message.text:
-        return
-
-    user_id = update.effective_user.id if update.effective_user else None
-    text = update.message.text
-
-    from analyzer import analyze_text_message, save_learning, get_leader, remember_exchange
-    name = team_name(gid)
-    leader = get_leader(name)
-
-    # ── Owner talking in group → bot watches silently ──
-    if user_id == OWNER_CHAT_ID:
-        remember_exchange(name, "", user_reply=f"[المالك]: {text[:200]}")
-        return
-
-    # ── PRIORITY: Check if bot is waiting for a correction FIRST ──
-    # (accept ANY message from the group, not just replies)
-    waiting_imgtype = context.chat_data.get("waiting_imgtype_correction", False)
-    if waiting_imgtype:
-        from analyzer import save_image_pattern, save_learning
-        # User told us what the image really is
-        save_image_pattern(text, text.strip())
-        save_learning(name, "image_type", "نوع صورة غلط", f"التيم ليدر قال: {text}")
-        context.chat_data["waiting_imgtype_correction"] = False
-        await update.message.reply_text(
-            f"✅ اتعلمت يا {leader}! المرة الجاية هعرفها لوحدي 💪"
-        )
-        return
-
-    # ── Check if this is a correction after user clicked ❌ or ✏️ ──
-    waiting = context.chat_data.get("waiting_correction", False)
-    if waiting:
-        wrong_analysis = context.chat_data.get("wrong_analysis", "")
-        save_learning(name, "correction", wrong_analysis, text)
-        context.chat_data["waiting_correction"] = False
-        context.chat_data["wrong_analysis"] = ""
-        await update.message.reply_text(
-            f"✅ اتعلمت يا {leader}! شكراً جداً على التوضيح.\n"
-            f"المرة الجاية هاخد ده في الاعتبار إن شاء الله 💪"
-        )
-        return
-
-    # ── Now check if the message is directed at the bot ──
-    bot_invited = any(w in text for w in ["محتاج البوت", "يا بوت", "EcoBot", "ecobot", "/bot"])
-
-    is_reply_to_bot = False
-    if update.message.reply_to_message and update.message.reply_to_message.from_user:
-        bot_user = await context.bot.get_me()
-        is_reply_to_bot = update.message.reply_to_message.from_user.id == bot_user.id
-
-    if not is_reply_to_bot and not bot_invited:
-        return  # Not talking to the bot
-
-    reply_to = ""
-    if update.message.reply_to_message:
-        reply_to = update.message.reply_to_message.text or ""
-
-    try:
-        response = await analyze_text_message(name, text, reply_to)
-        if response:
-            await update.message.reply_text(f"🤖 {response}")
-    except Exception as e:
-        logger.error("Text reply error (%s): %s", name, e)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Feedback handler: ✅ صح / ❌ غلط / ✏️ هعدل
-# ══════════════════════════════════════════════════════════════════════
-async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button clicks for feedback on bot analysis."""
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    gid = update.effective_chat.id
-    name = team_name(gid) if gid in TEAMS else "?"
-
-    from analyzer import get_leader, remember_exchange, save_learning
-    leader = get_leader(name)
-
-    if data == "fb_correct":
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(
-            chat_id=gid,
-            text=f"✅ تمام يا {leader}! شكراً إنك أكدتلي 💪",
-        )
-        remember_exchange(name, f"[✅] {leader} أكد")
-
-    elif data == "fb_wrong":
-        await query.edit_message_reply_markup(reply_markup=None)
-        last = _last_bot_analysis.get(gid, "")
-        await context.bot.send_message(
-            chat_id=gid,
-            text=(
-                f"😅 أنا آسف يا {leader}! لسه بتعلم والله.\n"
-                f"قولي إيه اللي قولته غلط وإيه الصح؟\n"
-                f"رد على الرسالة دي عشان أتعلم وأبقى أحسن المرة الجاية 🙏"
-            ),
-        )
-        # Mark that we're waiting for correction from this group
-        context.chat_data["waiting_correction"] = True
-        context.chat_data["wrong_analysis"] = last[:300]
-        remember_exchange(name, f"[❌ غلط] مستني تصحيح من {leader}")
-
-    elif data == "fb_edit":
-        await query.edit_message_reply_markup(reply_markup=None)
-        last = _last_bot_analysis.get(gid, "")
-        await context.bot.send_message(
-            chat_id=gid,
-            text=(
-                f"🙏 شكراً يا {leader}!\n"
-                f"قولي إيه المعلومة اللي محتاجة تتعدل وأنا هتعلمها.\n"
-                f"رد على الرسالة دي بالتعديل ✏️"
-            ),
-        )
-        context.chat_data["waiting_correction"] = True
-        context.chat_data["wrong_analysis"] = last[:300]
-        remember_exchange(name, f"[✏️ تعديل] مستني تصحيح من {leader}")
-
-
-# ── Forwarded message handler ────────────────────────────────────────
-async def handle_forwarded(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return
-    msg = update.message
-    await msg.reply_text(
-        f"Your Chat ID: {update.effective_chat.id}\n"
-        f"Message Chat ID: {msg.chat.id}\n"
-        f"Forward Origin: {msg.forward_origin}"
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════
-# Image type confirmation handler
-# ══════════════════════════════════════════════════════════════════════
-async def handle_imgtype_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle image type yes/no confirmation buttons."""
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    gid = update.effective_chat.id
-    name = team_name(gid) if gid in TEAMS else "?"
-
-    from analyzer import get_leader, save_image_pattern, remember_exchange
-
-    leader = get_leader(name)
-
-    if data.startswith("imgtype_yes_"):
-        # User confirmed image type is correct
-        img_type = data.replace("imgtype_yes_", "")
-        await query.edit_message_reply_markup(reply_markup=None)
-
-        # Save pattern for future
-        pending_result = context.chat_data.get("pending_result", {})
-        desc = pending_result.get("description", "")
-        if desc:
-            save_image_pattern(desc, img_type)
-
-        await context.bot.send_message(
-            chat_id=gid,
-            text=f"✅ شكراً يا {leader}! اتعلمت 💪",
-        )
-
-        # Now process the image normally
-        image_bytes = context.chat_data.get("pending_image")
-        if image_bytes:
-            pending_result["_low_confidence"] = False
-            from analyzer import (
-                handle_non_report_image, smart_analysis,
-                generate_quick_summary, REPORT_IMAGE_TYPES,
-            )
-
-            if img_type not in REPORT_IMAGE_TYPES:
-                response = await handle_non_report_image(
-                    image_bytes, name, img_type, desc
-                )
-                if response:
-                    await context.bot.send_message(
-                        chat_id=gid, text=f"🤖 {response}",
-                        reply_markup=feedback_keyboard(),
-                    )
-                    _last_bot_analysis[gid] = response
-            else:
-                # Count toward report requirement
-                hour_now = now_egypt().hour
-                if hour_now < 16:
-                    count = morning_photos.get(gid, 0) + 1
-                    morning_photos[gid] = count
-                    required = MORNING_REQUIRED
-                else:
-                    count = afternoon_photos.get(gid, 0) + 1
-                    afternoon_photos[gid] = count
-                    required = AFTERNOON_REQUIRED
-                period = "الصبح" if hour_now < 16 else "العصر"
-
-                result = pending_result
-                if "error" not in result:
-                    summary = generate_quick_summary(result)
-                    report_type = context.chat_data.get("pending_report_type", "morning")
-                    analysis = await smart_analysis(name, result, report_type, image_bytes)
-                    if analysis:
-                        leader = get_leader(name)
-                        header = f"📸 تقرير {period}: ({count}/{required})\n{summary}\n\n"
-                        await context.bot.send_message(
-                            chat_id=gid,
-                            text=header + analysis,
-                            reply_markup=feedback_keyboard(),
-                        )
-                        _last_bot_analysis[gid] = analysis
-                    if count == required:
-                        leader = get_leader(name)
-                        await context.bot.send_message(
-                            chat_id=gid, text=f"✅ تقرير {period} مكتمل! شكراً {leader} 🎉"
-                        )
-
-        # Clean up
-        context.chat_data.pop("pending_image", None)
-        context.chat_data.pop("pending_result", None)
-        context.chat_data.pop("pending_report_type", None)
-
-    elif data.startswith("imgtype_no_"):
-        # User says classification is wrong
-        await query.edit_message_reply_markup(reply_markup=None)
-        await context.bot.send_message(
-            chat_id=gid,
-            text=(
-                f"😅 معلش يا {leader}! قولي الصورة دي إيه بالظبط؟\n"
-                f"رد على الرسالة دي وقولي (مثلاً: فاتورة فيسبوك، شيت الطلبات، داشبورد تيك توك...)"
-            ),
-        )
-        context.chat_data["waiting_imgtype_correction"] = True
-        remember_exchange(name, f"[❌ نوع صورة غلط] مستني التصحيح من {leader}")
-
-
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ تم الإلغاء")
-    context.user_data.clear()
-    return ConversationHandler.END
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
 
 
 # ══════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════
-async def post_init(application):
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    from telegram import BotCommand
-    commands = [
-        BotCommand("morning", "تذكير الصبح - 3 screenshots"),
-        BotCommand("afternoon", "تذكير العصر - 3 screenshots"),
-        BotCommand("status", "حالة الفرق النهارده"),
-        BotCommand("compare", "مقارنة بالأرقام الحقيقية"),
-        BotCommand("alert", "إرسال تنبيه لفريق"),
-        BotCommand("broadcast", "إرسال رسالة لكل الفرق"),
-        BotCommand("team", "عرض حالة فريق"),
-        BotCommand("pause", "إيقاف تذكيرات لفريق"),
-        BotCommand("weekly", "طلب التقرير الأسبوعي"),
-        BotCommand("report", "ملخص يومي كامل"),
-        BotCommand("help", "قائمة الأوامر"),
-        BotCommand("start", "تشغيل البوت"),
-    ]
-    await application.bot.set_my_commands(commands)
-    logger.info("Bot ready! Timezone: Egypt (Africa/Cairo)")
-
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # Conversations
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("alert", alert_start)],
-        states={
-            ALERT_PICK_TEAM: [CallbackQueryHandler(alert_pick_team, pattern=r"^alert_")],
-            ALERT_TYPE_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, alert_type_msg)],
-            ALERT_CONFIRM: [CallbackQueryHandler(alert_confirm, pattern=r"^confirm_")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-    ))
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("broadcast", broadcast_start)],
-        states={
-            BROADCAST_TYPE_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_type_msg)],
-            BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_confirm, pattern=r"^confirm_")],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-    ))
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("team", team_start)],
-        states={TEAM_PICK: [CallbackQueryHandler(team_pick, pattern=r"^team_")]},
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-    ))
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("compare", compare_start)],
-        states={COMPARE_PICK: [CallbackQueryHandler(compare_pick, pattern=r"^team_")]},
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-    ))
-    app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("pause", pause_start)],
-        states={PAUSE_PICK: [CallbackQueryHandler(pause_pick, pattern=r"^team_")]},
-        fallbacks=[CommandHandler("cancel", cancel_cmd)],
-    ))
+    """Start the bot."""
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Commands
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("morning", morning_cmd))
-    app.add_handler(CommandHandler("afternoon", afternoon_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("weekly", weekly_cmd))
-    app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("morning", cmd_morning))
+    app.add_handler(CommandHandler("afternoon", cmd_afternoon))
+    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("team", cmd_team))
+    app.add_handler(CommandHandler("alert", cmd_alert))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("compare", cmd_compare))
+    app.add_handler(CommandHandler("pause", cmd_pause))
 
-    # Feedback & image type buttons handler
-    app.add_handler(CallbackQueryHandler(handle_feedback, pattern="^fb_"))
-    app.add_handler(CallbackQueryHandler(handle_imgtype_callback, pattern="^imgtype_"))
+    # Callback queries (all go through router)
+    app.add_handler(CallbackQueryHandler(callback_router))
 
-    # Media & text handlers
-    app.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, handle_forwarded))
+    # Photos
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION, handle_video))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_text))
 
-    # ══ Scheduled jobs (Egypt timezone) ══
+    # Videos
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
+
+    # Documents
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Text messages (must be last)
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handle_text
+    ))
+
+    # Error handler
+    app.add_error_handler(error_handler)
+
+    # Schedule jobs (Egypt/Cairo timezone)
     jq = app.job_queue
-    egypt_tz = EGYPT_TZ
 
-    # Auto morning reminder: 11:00 AM Egypt
-    jq.run_daily(auto_morning_reminder, time=time(hour=11, minute=0, tzinfo=egypt_tz))
-    # Auto afternoon reminder: 4:00 PM Egypt
-    jq.run_daily(auto_afternoon_reminder, time=time(hour=16, minute=0, tzinfo=egypt_tz))
-    # Daily summary: 12:00 PM Egypt
-    jq.run_daily(daily_noon_report, time=time(hour=12, minute=0, tzinfo=egypt_tz))
-    # Proactive sheet check: 1:30 PM (after master sheet updates at 1 PM)
-    jq.run_daily(proactive_check, time=time(hour=13, minute=30, tzinfo=egypt_tz))
-    # Smart AI daily report: 2:00 PM
-    jq.run_daily(smart_daily_report, time=time(hour=14, minute=0, tzinfo=egypt_tz))
-    # Daily reset: midnight Egypt
-    jq.run_daily(daily_reset, time=time(hour=0, minute=5, tzinfo=egypt_tz))
-    # Weekly + salary check: 10:00 AM Egypt
-    jq.run_daily(check_weekly_and_salary, time=time(hour=10, minute=0, tzinfo=egypt_tz))
-
-    logger.info(
-        "Bot started! Owner: %s, Teams: %s, TZ: Egypt",
-        OWNER_CHAT_ID, list(TEAMS.values())
+    # 10:30 AM - Friendly pre-reminder
+    jq.run_daily(
+        send_morning_prereminder,
+        time=time(hour=10, minute=30, tzinfo=EGYPT_TZ),
+        name="morning_prereminder",
     )
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    # 11:00 AM - Deadline + start tracking + schedule follow-ups
+    jq.run_daily(
+        send_smart_morning_reminder,
+        time=time(hour=11, minute=0, tzinfo=EGYPT_TZ),
+        name="morning_reminder",
+    )
+
+    # 12:00 PM - Final morning check + owner approval flow
+    jq.run_daily(
+        final_morning_check,
+        time=time(hour=12, minute=0, tzinfo=EGYPT_TZ),
+        name="final_morning_check",
+    )
+
+    # 1:30 PM - Proactive check
+    jq.run_daily(
+        proactive_check,
+        time=time(hour=13, minute=30, tzinfo=EGYPT_TZ),
+        name="proactive_check",
+    )
+
+    # 2:00 PM - Smart daily report
+    jq.run_daily(
+        smart_daily_report,
+        time=time(hour=14, minute=0, tzinfo=EGYPT_TZ),
+        name="smart_daily_report",
+    )
+
+    # 4:00 PM - Afternoon questions
+    jq.run_daily(
+        send_afternoon_questions,
+        time=time(hour=16, minute=0, tzinfo=EGYPT_TZ),
+        name="afternoon_questions",
+    )
+
+    # 12:05 AM - Daily reset
+    jq.run_daily(
+        daily_reset,
+        time=time(hour=0, minute=5, tzinfo=EGYPT_TZ),
+        name="daily_reset",
+    )
+
+    logger.info("EcoTeam Agent V2 starting...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.set_event_loop(asyncio.new_event_loop())
     main()

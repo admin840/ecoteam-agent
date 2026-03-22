@@ -1,32 +1,53 @@
 """
-AI-powered Performance Marketing Manager.
-Smart context system: builds full team intelligence before every analysis.
-Verification: compares screenshots with sheet data, flags discrepancies.
-Memory: tracks conversations per team for contextual follow-ups.
-Cross-team: ranks teams, detects anomalies, provides strategic insights.
+EcoTeam Agent V2 - AI-powered Performance Marketing Manager.
+Manages 11 advertising teams running Facebook/TikTok message ads in Kuwait.
+
+Core systems:
+- Team sheet reading (individual Google Sheets per team)
+- Master sheet aggregation
+- Tracking sheet (logging received images, missing items)
+- Screenshot number extraction (user selects type via buttons)
+- Smart analysis with verification, anomaly detection, cross-team ranking
+- Creative analysis (video + image) with scorecard
+- Conversation memory per team
+- Proactive monitoring & daily reports
 """
 import os
+import re
+import csv
 import json
 import base64
 import logging
 import subprocess
 import tempfile
+import io as _io
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
 import httpx
 import anthropic
 
 logger = logging.getLogger(__name__)
 EGYPT_TZ = ZoneInfo("Africa/Cairo")
 
+
 def _now_egypt():
     return datetime.now(EGYPT_TZ)
 
+
+# ── Config ────────────────────────────────────────────────────────────
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 MASTER_SHEET_URL = os.environ.get("MASTER_SHEET_URL", "")
+TRACKING_SHEET_URL = "https://script.google.com/macros/s/AKfycbxorxOudJDqD_55pElkEEtGM16VutZg-vxMSMDHaBCnIK17H5jAOcK0gfr5bKcqIl-p6Q/exec"
+TRACKING_SHEET_ID = "1aKF2b3oRSkdvpybmmE_j1U34DVn6mpJSyjPp5btnBvg"
 
-# ── Team info ────────────────────────────────────────────────────────
+# Persistent storage: /data on Railway, fallback to cwd
+DATA_DIR = Path("/data") if Path("/data").exists() else Path(".")
+
+
+# ── Team info (EXACT - do not change) ─────────────────────────────────
 TEAM_INFO = {
     "Kuwaitmall":  {"leader": "سمر",    "sheet_name": "Fordeal",    "sheet_id": "1ckXTIE5P0POiOmeDSnGHPlJqHOF9a9LiGOLwu8XHMxo"},
     "Meeven":      {"leader": "غرام",   "sheet_name": "Meveen",     "sheet_id": "13SYsxvgLVDkVlZ1y1UnwngDVxn6wr91xwI_9eG3FZE4"},
@@ -48,9 +69,31 @@ CPA_GREEN = 150
 CPA_YELLOW = 180
 CANCEL_RED = 30
 
+# Image types the bot processes (user selects via button, no auto-classification)
+IMAGE_TYPES = {
+    "fb_ads_dashboard":  "داشبورد حملات Facebook Ads Manager",
+    "tt_ads_dashboard":  "داشبورد حملات TikTok Ads",
+    "fb_payment":        "صفحة دفع/billing من فيسبوك",
+    "tt_payment":        "صفحة دفع/billing من تيك توك",
+    "order_sheet":       "شيت الطلبات اليومي",
+    "budget_sheet":      "شيت البادجيت أو أكواد فوري",
+    "creative_image":    "إعلان (صورة/فيديو creative)",
+    "other":             "صورة تانية",
+}
+
+REPORT_IMAGE_TYPES = {"fb_ads_dashboard", "tt_ads_dashboard", "order_sheet", "budget_sheet"}
+PAYMENT_IMAGE_TYPES = {"fb_payment", "tt_payment"}
+
+# Team sheet columns (0-13)
+TEAM_SHEET_COLUMNS = [
+    "Date", "Spend", "New Orders", "Yesterday New",
+    "Delivered", "Cancel", "Hold", "CPO",
+    "Daily Target", "Gap", "Lamp", "Del%", "Cancel%", "Hold%",
+]
+
 
 # ══════════════════════════════════════════════════════════════════════
-# Basic helpers (API unchanged for main.py compatibility)
+# BASIC HELPERS
 # ══════════════════════════════════════════════════════════════════════
 
 def get_leader(team_name: str) -> str:
@@ -61,7 +104,52 @@ def get_sheet_name(team_name: str) -> str:
     return TEAM_INFO.get(team_name, {}).get("sheet_name", team_name)
 
 
+def _safe_num(val) -> float | None:
+    """Safely convert any value to a number."""
+    if val is None or val == "" or val == "-":
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        cleaned = str(val).replace(",", "").replace("٬", "").replace("%", "").strip()
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_sheet_date(date_str: str):
+    """Parse date from team sheet (M/D/YYYY)."""
+    if not date_str:
+        return None
+    date_str = str(date_str).strip()
+    m = re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})', date_str)
+    if m:
+        try:
+            month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return datetime(year, month, day)
+        except ValueError:
+            return None
+    return None
+
+
+def _current_sheet_tab() -> str:
+    """Get current month's tab name: 'March-2026' (cycle runs 26th to 25th)."""
+    now = _now_egypt()
+    if now.day >= 26:
+        if now.month == 12:
+            return f"January-{now.year + 1}"
+        month_names = ["", "January", "February", "March", "April", "May", "June",
+                       "July", "August", "September", "October", "November", "December"]
+        return f"{month_names[now.month + 1]}-{now.year}"
+    return f"{now.strftime('%B')}-{now.year}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MASTER SHEET FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════
+
 async def fetch_master_data() -> list[dict]:
+    """Fetch aggregated data from the master Google Sheet."""
     if not MASTER_SHEET_URL:
         return []
     try:
@@ -76,19 +164,12 @@ async def fetch_master_data() -> list[dict]:
 
 
 async def trigger_master_update() -> bool:
-    """
-    Tell Apps Script to update the master sheet NOW.
-    Call this when all teams have submitted their data.
-    Returns True if update succeeded.
-    """
+    """POST to master sheet Apps Script to trigger update now."""
     if not MASTER_SHEET_URL:
         return False
     try:
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            resp = await client.post(
-                MASTER_SHEET_URL,
-                json={"action": "update"},
-            )
+            resp = await client.post(MASTER_SHEET_URL, json={"action": "update"})
             data = resp.json()
             if data.get("success"):
                 logger.info("Master sheet updated successfully!")
@@ -102,6 +183,7 @@ async def trigger_master_update() -> bool:
 
 
 def get_team_today_data(all_data: list[dict], team_name: str) -> dict | None:
+    """Get latest row for a team from master sheet."""
     sheet_name = get_sheet_name(team_name)
     for row in reversed(all_data):
         if row.get("المجموعة") == sheet_name:
@@ -110,156 +192,24 @@ def get_team_today_data(all_data: list[dict], team_name: str) -> dict | None:
 
 
 def get_team_history(all_data: list[dict], team_name: str, days: int = 7) -> list[dict]:
+    """Get last N days of data for a team from master sheet."""
     sheet_name = get_sheet_name(team_name)
     rows = [r for r in all_data if r.get("المجموعة") == sheet_name]
     return rows[-days:] if len(rows) > days else rows
 
 
 # ══════════════════════════════════════════════════════════════════════
-# PERSISTENT LEARNING MEMORY - bot learns from corrections
+# INDIVIDUAL TEAM SHEET - read directly from team's Google Sheet
 # ══════════════════════════════════════════════════════════════════════
-
-# Persistent storage: use /data volume on Railway, fallback to current dir
-DATA_DIR = Path("/data") if Path("/data").exists() else Path(".")
-
-LEARNINGS_FILE = DATA_DIR / "learnings.json"
-
-
-def load_learnings() -> list[dict]:
-    """Load all past corrections/learnings from file."""
-    if LEARNINGS_FILE.exists():
-        try:
-            return json.loads(LEARNINGS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-    return []
-
-
-def save_learning(team_name: str, category: str, what_bot_said: str, correction: str):
-    """Save a correction so the bot learns from it."""
-    data = load_learnings()
-    data.append({
-        "date": _now_egypt().strftime("%Y-%m-%d %H:%M"),
-        "team": team_name,
-        "category": category,  # "image_type", "numbers", "analysis", "other"
-        "bot_said": what_bot_said[:300],
-        "correction": correction[:300],
-    })
-    # Keep last 100 learnings
-    data = data[-100:]
-    LEARNINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("Learning saved: %s - %s", category, correction[:50])
-
-
-def get_learnings_for_prompt(team_name: str = "", last_n: int = 5) -> str:
-    """Get relevant learnings to include in prompts."""
-    data = load_learnings()
-    if not data:
-        return ""
-
-    # Filter by team if specified, otherwise get recent
-    if team_name:
-        relevant = [d for d in data if d["team"] == team_name][-last_n:]
-    else:
-        relevant = data[-last_n:]
-
-    if not relevant:
-        return ""
-
-    lines = ["## تصحيحات سابقة (اتعلمت منها):"]
-    for d in relevant:
-        lines.append(f"- {d['date']}: {d['correction']}")
-    return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# IMAGE PATTERN MEMORY - bot learns image types from corrections
-# ══════════════════════════════════════════════════════════════════════
-
-IMAGE_PATTERNS_FILE = DATA_DIR / "image_patterns.json"
-
-
-def load_image_patterns() -> dict:
-    """Load learned image patterns: {description_keyword: correct_type}"""
-    if IMAGE_PATTERNS_FILE.exists():
-        try:
-            return json.loads(IMAGE_PATTERNS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-
-def save_image_pattern(description: str, correct_type: str):
-    """Save a learned image pattern so bot recognizes it next time."""
-    patterns = load_image_patterns()
-    # Extract keywords from description
-    keywords = [w.strip().lower() for w in description.split() if len(w.strip()) > 2]
-    for kw in keywords:
-        patterns[kw] = correct_type
-    IMAGE_PATTERNS_FILE.write_text(json.dumps(patterns, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("Image pattern learned: %s -> %s", description[:50], correct_type)
-
-
-def check_learned_patterns(description: str) -> str | None:
-    """Check if we've learned what this image type is from past corrections."""
-    patterns = load_image_patterns()
-    if not patterns:
-        return None
-    desc_lower = description.lower()
-    matches = {}
-    for keyword, img_type in patterns.items():
-        if keyword in desc_lower:
-            matches[img_type] = matches.get(img_type, 0) + 1
-    if matches:
-        # Return the type with most keyword matches
-        return max(matches, key=matches.get)
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════
-# INDIVIDUAL TEAM SHEET - read directly from team's own Google Sheet
-# ══════════════════════════════════════════════════════════════════════
-
-import csv
-import io as _io
-
-def _current_sheet_tab() -> str:
-    """Get current month's tab name: 'March-2026' (cycle runs 26th to 25th)."""
-    now = _now_egypt()
-    # Month cycle: 26th to 25th. If we're before 26th, use current month name.
-    # If 26th or later, use next month name.
-    if now.day >= 26:
-        # Next month's cycle has started
-        if now.month == 12:
-            return f"January-{now.year + 1}"
-        month_names = ["", "January", "February", "March", "April", "May", "June",
-                       "July", "August", "September", "October", "November", "December"]
-        return f"{month_names[now.month + 1]}-{now.year}"
-    return f"{now.strftime('%B')}-{now.year}"
-
-
-# Standard column names for team sheets (same across all teams)
-TEAM_SHEET_COLUMNS = [
-    "Date", "Spend", "New Orders", "Yesterday New",
-    "Delivered", "Cancel", "Hold", "CPO",
-    "Daily Target", "Gap", "Lamp", "Del%", "Cancel%", "Hold%",
-]
-
 
 async def fetch_team_sheet(team_name: str) -> list[dict]:
-    """
-    Read data directly from a team's individual Google Sheet.
-    The sheet has a summary section at top, then daily data below.
-    We find the "Date" header row and parse from there.
-    """
+    """Read data directly from a team's individual Google Sheet (CSV export)."""
     info = TEAM_INFO.get(team_name)
     if not info or not info.get("sheet_id"):
         return []
 
     sheet_id = info["sheet_id"]
     tab_name = _current_sheet_tab()
-
-    import urllib.parse
     encoded_tab = urllib.parse.quote(tab_name)
     url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_tab}"
 
@@ -275,14 +225,12 @@ async def fetch_team_sheet(team_name: str) -> list[dict]:
                 logger.warning("Team sheet not accessible for %s (got HTML)", team_name)
                 return []
 
-            # Parse CSV - raw rows first
             reader = csv.reader(_io.StringIO(text))
             all_rows = list(reader)
-
             if not all_rows:
                 return []
 
-            # Find the header row (the one that starts with "Date" or contains date-like header)
+            # Find the header row
             header_idx = None
             for i, row in enumerate(all_rows):
                 first_cell = row[0].strip() if row else ""
@@ -291,23 +239,21 @@ async def fetch_team_sheet(team_name: str) -> list[dict]:
                     break
 
             if header_idx is None:
-                # Fallback: use our known column names and find first date row
+                # Fallback: find date rows directly
                 data_rows = []
                 for row in all_rows:
                     first_cell = row[0].strip() if row else ""
                     if "/" in first_cell and len(first_cell) <= 12:
-                        # Map to our standard columns
                         row_dict = {}
                         for j, col_name in enumerate(TEAM_SHEET_COLUMNS):
                             if j < len(row):
                                 row_dict[col_name] = row[j].strip()
                         data_rows.append(row_dict)
-                logger.info("Fetched %d rows from %s (no header, used standard columns)", len(data_rows), team_name)
+                logger.info("Fetched %d rows from %s (no header)", len(data_rows), team_name)
                 return data_rows
 
-            # Use the real header row
+            # Map headers to standard column names
             headers = [h.strip() for h in all_rows[header_idx]]
-            # Map headers to standard names (first 14 columns)
             mapped_headers = []
             for j, h in enumerate(headers):
                 if j < len(TEAM_SHEET_COLUMNS):
@@ -315,13 +261,11 @@ async def fetch_team_sheet(team_name: str) -> list[dict]:
                 else:
                     mapped_headers.append(h if h else f"col_{j}")
 
-            # Parse data rows after header
             data_rows = []
             for row in all_rows[header_idx + 1:]:
                 first_cell = row[0].strip() if row else ""
                 if not first_cell or "/" not in first_cell:
-                    continue  # Skip non-data rows
-
+                    continue
                 row_dict = {}
                 for j, col_name in enumerate(mapped_headers):
                     if j < len(row):
@@ -336,66 +280,23 @@ async def fetch_team_sheet(team_name: str) -> list[dict]:
         return []
 
 
-def _parse_sheet_date(date_str: str):
-    """Parse date from team sheet (M/D/YYYY or similar formats)."""
-    if not date_str:
-        return None
-    date_str = str(date_str).strip()
-    import re
-    m = re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})', date_str)
-    if m:
-        try:
-            month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            return datetime(year, month, day)
-        except ValueError:
-            return None
-    return None
-
-
 def get_team_sheet_today(rows: list[dict]) -> dict | None:
-    """Get latest row that has actual Spend data AND is not in the future."""
+    """Get latest row that has actual Spend data and is not future-dated."""
     if not rows:
         return None
-
     today = _now_egypt().replace(hour=0, minute=0, second=0, microsecond=0)
-
     for row in reversed(rows):
         spend_str = row.get("Spend", "").strip().replace(",", "")
         try:
             spend_val = float(spend_str) if spend_str else 0
         except ValueError:
             spend_val = 0
-
         if spend_val <= 0:
             continue
-
-        # Skip future dates - team leader might pre-fill tomorrow's row
         row_date = _parse_sheet_date(row.get("Date", ""))
         if row_date and row_date > today:
-            continue  # Future date, skip it
-
+            continue
         return row
-    return None
-
-
-def calculate_cpa_from_sheet(rows: list[dict]) -> float | None:
-    """
-    Calculate CPA correctly:
-    CPA = Spend from PREVIOUS row ÷ Delivered from CURRENT (latest) row.
-    Because delivery of day X is recorded in day X+1's row.
-    """
-    data_rows = [r for r in rows if _safe_num(r.get("Spend")) and _safe_num(r.get("Spend")) > 0]
-    if len(data_rows) < 2:
-        return None
-
-    current_row = data_rows[-1]  # Latest row
-    previous_row = data_rows[-2]  # Previous row
-
-    prev_spend = _safe_num(previous_row.get("Spend"))
-    curr_delivered = _safe_num(current_row.get("Delivered"))
-
-    if prev_spend and prev_spend > 0 and curr_delivered and curr_delivered > 0:
-        return round(prev_spend / curr_delivered)
     return None
 
 
@@ -405,31 +306,181 @@ def get_team_sheet_recent(rows: list[dict], n: int = 5) -> list[dict]:
     return data_rows[-n:]
 
 
+def calculate_cpa_from_sheet(rows: list[dict]) -> float | None:
+    """
+    CPA = Spend from PREVIOUS row / Delivered from CURRENT (latest) row.
+    Because delivery of day X is recorded in day X+1's row.
+    """
+    data_rows = [r for r in rows if _safe_num(r.get("Spend")) and _safe_num(r.get("Spend")) > 0]
+    if len(data_rows) < 2:
+        return None
+    current_row = data_rows[-1]
+    previous_row = data_rows[-2]
+    prev_spend = _safe_num(previous_row.get("Spend"))
+    curr_delivered = _safe_num(current_row.get("Delivered"))
+    if prev_spend and prev_spend > 0 and curr_delivered and curr_delivered > 0:
+        return round(prev_spend / curr_delivered)
+    return None
+
+
 def format_team_sheet_data(row: dict) -> str:
-    """Format team sheet row - pass all non-empty values."""
+    """Format a single team sheet row for display."""
     if not row:
         return "مفيش بيانات"
     parts = []
     for k, v in row.items():
         v_str = str(v).strip()
-        if v_str and v_str != "" and k.strip():
+        if v_str and k.strip():
             parts.append(f"  {k}: {v_str}")
     return "\n".join(parts)
 
 
-def format_team_sheet_table(rows: list[dict]) -> str:
-    """Format multiple team sheet rows into a readable table."""
-    if not rows:
-        return ""
-    parts = []
-    for row in rows:
-        vals = [f"{str(v).strip()}" for v in row.values() if str(v).strip()]
-        parts.append(" | ".join(vals))
-    return "\n".join(parts)
+# ══════════════════════════════════════════════════════════════════════
+# TRACKING SHEET FUNCTIONS (NEW in V2)
+# ══════════════════════════════════════════════════════════════════════
+
+async def log_to_tracking(
+    team: str, leader: str, image_type: str, platform: str,
+    account_num: str, amount: str, ai_notes: str, task_type: str,
+    message_id: str = "", status: str = "⏳"
+) -> dict:
+    """Log an image/interaction to the tracking sheet."""
+    try:
+        payload = {
+            "action": "log",
+            "team": team,
+            "leader": leader,
+            "image_type": image_type,
+            "platform": platform,
+            "account_num": account_num,
+            "amount": amount,
+            "ai_notes": ai_notes,
+            "task_type": task_type,
+            "message_id": message_id,
+            "status": status,
+            "date": _now_egypt().strftime("%Y-%m-%d"),
+            "time": _now_egypt().strftime("%H:%M"),
+        }
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.post(TRACKING_SHEET_URL, json=payload)
+            data = resp.json()
+            if data.get("success"):
+                logger.info("Logged to tracking: %s %s %s", team, image_type, task_type)
+                return data
+            else:
+                logger.error("Tracking log failed: %s", data.get("error"))
+                return {"success": False, "error": data.get("error", "unknown")}
+    except Exception as e:
+        logger.error("Tracking log error: %s", e)
+        return {"success": False, "error": str(e)}
+
+
+async def get_team_tracking_today(team_name: str, task_type: str = "morning") -> list[dict]:
+    """Get all entries logged for a team today from the tracking sheet."""
+    try:
+        params = {
+            "action": "read",
+            "team": team_name,
+            "task_type": task_type,
+            "date": _now_egypt().strftime("%Y-%m-%d"),
+        }
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(TRACKING_SHEET_URL, params=params)
+            data = resp.json()
+            if data.get("success"):
+                return data.get("entries", [])
+    except Exception as e:
+        logger.error("Tracking read error for %s: %s", team_name, e)
+    return []
+
+
+async def get_team_accounts(team_name: str) -> dict:
+    """Get known account counts for a team from tracking sheet."""
+    try:
+        params = {
+            "action": "read_accounts",
+            "team": team_name,
+        }
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(TRACKING_SHEET_URL, params=params)
+            data = resp.json()
+            if data.get("success"):
+                return data.get("accounts", {})
+    except Exception as e:
+        logger.error("Account read error for %s: %s", team_name, e)
+    return {}
+
+
+async def update_tracking_status(row_num: int, status: str, comment: str = "") -> bool:
+    """Update the status of a tracking entry."""
+    try:
+        payload = {
+            "action": "update_status",
+            "row": row_num,
+            "status": status,
+            "comment": comment,
+        }
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.post(TRACKING_SHEET_URL, json=payload)
+            data = resp.json()
+            return data.get("success", False)
+    except Exception as e:
+        logger.error("Tracking status update error: %s", e)
+        return False
+
+
+async def get_missing_for_team(team_name: str, task_type: str = "morning") -> dict:
+    """
+    Compare what was received vs what's needed, return missing items.
+    Returns: {missing: [...], received: [...], complete: bool}
+    """
+    received = await get_team_tracking_today(team_name, task_type)
+    accounts = await get_team_accounts(team_name)
+
+    # Categorize received items
+    received_types = set()
+    received_platforms = set()
+    for entry in received:
+        received_types.add(entry.get("image_type", ""))
+        received_platforms.add(entry.get("platform", ""))
+
+    missing = []
+
+    if task_type == "morning":
+        # Morning: need dashboard + payment for each platform they use
+        if "fb_ads_dashboard" not in received_types:
+            missing.append({"type": "fb_ads_dashboard", "label": "داشبورد فيسبوك"})
+        if "fb_payment" not in received_types:
+            missing.append({"type": "fb_payment", "label": "صفحة دفع فيسبوك"})
+
+        # Check if team uses TikTok
+        has_tiktok = accounts.get("tiktok", 0) > 0
+        if has_tiktok:
+            if "tt_ads_dashboard" not in received_types:
+                missing.append({"type": "tt_ads_dashboard", "label": "داشبورد تيك توك"})
+            if "tt_payment" not in received_types:
+                missing.append({"type": "tt_payment", "label": "صفحة دفع تيك توك"})
+
+        # Order sheet
+        if "order_sheet" not in received_types:
+            missing.append({"type": "order_sheet", "label": "شيت الطلبات"})
+
+    elif task_type == "evening":
+        # Evening: need updated order sheet
+        if "order_sheet" not in received_types:
+            missing.append({"type": "order_sheet", "label": "شيت الطلبات (مسائي)"})
+
+    return {
+        "missing": missing,
+        "received": received,
+        "received_types": list(received_types),
+        "complete": len(missing) == 0,
+        "accounts": accounts,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 1. CONVERSATION MEMORY - per-team context tracking
+# CONVERSATION MEMORY - per-team context tracking
 # ══════════════════════════════════════════════════════════════════════
 
 _conversation_memory: dict[str, list[dict]] = {}
@@ -440,25 +491,21 @@ def remember_exchange(team_name: str, bot_msg: str, user_reply: str | None = Non
     """Store a bot message (and optional user reply) in team memory."""
     if team_name not in _conversation_memory:
         _conversation_memory[team_name] = []
-
     entry = {
-        "time": datetime.now().strftime("%H:%M"),
-        "bot": bot_msg[:500],  # truncate to save memory
+        "time": _now_egypt().strftime("%H:%M"),
+        "bot": bot_msg[:500],
     }
     if user_reply:
         entry["user"] = user_reply[:300]
-
     _conversation_memory[team_name].append(entry)
-    # Keep only last N exchanges
     _conversation_memory[team_name] = _conversation_memory[team_name][-MAX_MEMORY_PER_TEAM:]
 
 
 def get_recent_context(team_name: str, last_n: int = 3) -> str:
-    """Get recent conversation history as formatted text for prompts."""
+    """Get recent conversation history as formatted text."""
     history = _conversation_memory.get(team_name, [])
     if not history:
         return ""
-
     lines = ["## محادثات سابقة اليوم:"]
     for ex in history[-last_n:]:
         lines.append(f"[{ex['time']}] البوت: {ex['bot'][:200]}")
@@ -473,100 +520,194 @@ def reset_conversation_memory():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 2. SMART HELPERS - numbers parsing
+# PERSISTENT LEARNING MEMORY
 # ══════════════════════════════════════════════════════════════════════
 
-def _safe_num(val) -> float | None:
-    """Safely convert any value to a number."""
-    if val is None or val == "" or val == "-":
-        return None
-    if isinstance(val, (int, float)):
-        return float(val)
-    try:
-        cleaned = str(val).replace(",", "").replace("٬", "").replace("%", "").strip()
-        return float(cleaned)
-    except (ValueError, TypeError):
-        return None
+LEARNINGS_FILE = DATA_DIR / "learnings.json"
+
+
+def load_learnings() -> list[dict]:
+    if LEARNINGS_FILE.exists():
+        try:
+            return json.loads(LEARNINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_learning(team_name: str, category: str, what_bot_said: str, correction: str):
+    """Save a correction so the bot learns from it."""
+    data = load_learnings()
+    data.append({
+        "date": _now_egypt().strftime("%Y-%m-%d %H:%M"),
+        "team": team_name,
+        "category": category,
+        "bot_said": what_bot_said[:300],
+        "correction": correction[:300],
+    })
+    data = data[-100:]
+    LEARNINGS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Learning saved: %s - %s", category, correction[:50])
+
+
+def get_learnings_for_prompt(team_name: str = "", last_n: int = 5) -> str:
+    data = load_learnings()
+    if not data:
+        return ""
+    if team_name:
+        relevant = [d for d in data if d["team"] == team_name][-last_n:]
+    else:
+        relevant = data[-last_n:]
+    if not relevant:
+        return ""
+    lines = ["## تصحيحات سابقة (اتعلمت منها):"]
+    for d in relevant:
+        lines.append(f"- {d['date']}: {d['correction']}")
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 3. VERIFICATION SYSTEM - screenshot vs sheet comparison
+# CREATIVE TRACKING
+# ══════════════════════════════════════════════════════════════════════
+
+CREATIVE_HISTORY_FILE = DATA_DIR / "creative_history.json"
+
+
+def load_creative_history() -> list[dict]:
+    if CREATIVE_HISTORY_FILE.exists():
+        try:
+            return json.loads(CREATIVE_HISTORY_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_creative_record(team_name: str, creative_type: str, analysis_summary: str):
+    history = load_creative_history()
+    history.append({
+        "date": _now_egypt().strftime("%Y-%m-%d"),
+        "team": team_name,
+        "type": creative_type,
+        "summary": analysis_summary[:300],
+    })
+    history = history[-50:]
+    CREATIVE_HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_last_creative(team_name: str) -> dict | None:
+    history = load_creative_history()
+    for record in reversed(history):
+        if record["team"] == team_name:
+            return record
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BUDGET TRACKING
+# ══════════════════════════════════════════════════════════════════════
+
+BUDGET_FILE = DATA_DIR / "budget_tracking.json"
+
+
+def load_budget_data() -> list[dict]:
+    if BUDGET_FILE.exists():
+        try:
+            return json.loads(BUDGET_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_budget_entry(team_name: str, amount: float, payment_type: str, platform: str, source: str = ""):
+    data = load_budget_data()
+    data.append({
+        "date": _now_egypt().strftime("%Y-%m-%d"),
+        "team": team_name,
+        "amount": amount,
+        "type": payment_type,
+        "platform": platform,
+        "source": source,
+    })
+    BUDGET_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("Budget entry: %s +%s (%s/%s)", team_name, amount, payment_type, platform)
+
+
+def get_team_budget_today(team_name: str) -> dict:
+    data = load_budget_data()
+    today = _now_egypt().strftime("%Y-%m-%d")
+    today_entries = [d for d in data if d["team"] == team_name and d["date"] == today]
+    total = sum(d["amount"] for d in today_entries)
+    by_type = {}
+    for d in today_entries:
+        by_type[d["type"]] = by_type.get(d["type"], 0) + d["amount"]
+    return {"total": total, "by_type": by_type, "entries": today_entries}
+
+
+def get_team_budget_month(team_name: str) -> dict:
+    data = load_budget_data()
+    month = _now_egypt().strftime("%Y-%m")
+    month_entries = [d for d in data if d["team"] == team_name and d["date"].startswith(month)]
+    total = sum(d["amount"] for d in month_entries)
+    return {"total": total, "count": len(month_entries)}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# VERIFICATION SYSTEM - screenshot vs sheet comparison
 # ══════════════════════════════════════════════════════════════════════
 
 def verify_screenshot_vs_sheet(screenshot_data: dict, sheet_data: dict | None) -> dict:
     """
     Compare screenshot numbers with sheet data.
     Returns: {status, discrepancies[], summary}
-    status: 'match' | 'minor_diff' | 'major_diff' | 'no_sheet_data'
     """
     if not sheet_data:
         return {"status": "no_sheet_data", "discrepancies": [], "summary": "الشيت لسه مش متحدث"}
 
     discrepancies = []
 
-    # Compare Spend - only when BOTH have real numbers
+    # Compare Spend
     ss_spend = _safe_num(screenshot_data.get("spend"))
     sh_spend = _safe_num(sheet_data.get("Spend اليوم"))
-    if ss_spend is not None and ss_spend > 0 and sh_spend is not None and sh_spend > 0:
-        # Both have real values - compare them
+    if ss_spend and ss_spend > 0 and sh_spend and sh_spend > 0:
         diff_pct = abs(ss_spend - sh_spend) / sh_spend * 100
         if diff_pct > 10:
             discrepancies.append({
-                "field": "Spend",
-                "screenshot": ss_spend,
-                "sheet": sh_spend,
-                "diff_pct": round(diff_pct, 1),
-                "severity": "major",
+                "field": "Spend", "screenshot": ss_spend, "sheet": sh_spend,
+                "diff_pct": round(diff_pct, 1), "severity": "major",
             })
         elif diff_pct > 3:
             discrepancies.append({
-                "field": "Spend",
-                "screenshot": ss_spend,
-                "sheet": sh_spend,
-                "diff_pct": round(diff_pct, 1),
-                "severity": "minor",
+                "field": "Spend", "screenshot": ss_spend, "sheet": sh_spend,
+                "diff_pct": round(diff_pct, 1), "severity": "minor",
             })
-    # If sheet is 0 but screenshot has data = sheet not updated yet (NOT a problem)
 
-    # Compare Orders - only when BOTH have real numbers
+    # Compare Orders
     ss_orders = _safe_num(screenshot_data.get("orders") or screenshot_data.get("results"))
     sh_orders = _safe_num(sheet_data.get("Orders اليوم"))
-    if ss_orders is not None and ss_orders > 0 and sh_orders is not None and sh_orders > 0:
-        # Both have real values - compare them
+    if ss_orders and ss_orders > 0 and sh_orders and sh_orders > 0:
         diff = abs(ss_orders - sh_orders)
         if diff > 2:
             discrepancies.append({
-                "field": "Orders",
-                "screenshot": ss_orders,
-                "sheet": sh_orders,
-                "diff": diff,
-                "severity": "major",
+                "field": "Orders", "screenshot": ss_orders, "sheet": sh_orders,
+                "diff": diff, "severity": "major",
             })
         elif diff > 0:
             discrepancies.append({
-                "field": "Orders",
-                "screenshot": ss_orders,
-                "sheet": sh_orders,
-                "diff": diff,
-                "severity": "minor",
+                "field": "Orders", "screenshot": ss_orders, "sheet": sh_orders,
+                "diff": diff, "severity": "minor",
             })
-    # If sheet is 0 but screenshot has orders = sheet not updated yet (NOT a problem)
 
-    # Compare CPO - only when BOTH have real numbers
+    # Compare CPO
     ss_cpo = _safe_num(screenshot_data.get("cpo"))
     sh_cpo = _safe_num(sheet_data.get("CPO اليوم"))
-    if ss_cpo is not None and ss_cpo > 0 and sh_cpo is not None and sh_cpo > 0:
+    if ss_cpo and ss_cpo > 0 and sh_cpo and sh_cpo > 0:
         diff_pct = abs(ss_cpo - sh_cpo) / sh_cpo * 100
         if diff_pct > 15:
             discrepancies.append({
-                "field": "CPO",
-                "screenshot": ss_cpo,
-                "sheet": sh_cpo,
-                "diff_pct": round(diff_pct, 1),
-                "severity": "major",
+                "field": "CPO", "screenshot": ss_cpo, "sheet": sh_cpo,
+                "diff_pct": round(diff_pct, 1), "severity": "major",
             })
 
-    # Determine overall status
     has_major = any(d["severity"] == "major" for d in discrepancies)
     has_minor = any(d["severity"] == "minor" for d in discrepancies)
 
@@ -576,7 +717,6 @@ def verify_screenshot_vs_sheet(screenshot_data: dict, sheet_data: dict | None) -
     sheet_is_empty = (not sh_spend_val or sh_spend_val == 0) and (not sh_orders_val or sh_orders_val == 0)
 
     if sheet_is_empty and (ss_spend or ss_orders):
-        # Sheet not updated yet - this is normal, NOT a problem
         return {
             "status": "sheet_not_updated",
             "discrepancies": [],
@@ -584,24 +724,19 @@ def verify_screenshot_vs_sheet(screenshot_data: dict, sheet_data: dict | None) -
         }
 
     if has_major:
-        status = "major_diff"
         parts = []
         for d in discrepancies:
             if d["severity"] == "major":
                 parts.append(f"⚠️ {d['field']}: Screenshot={d['screenshot']:,.0f} vs Sheet={d['sheet']:,.0f}")
-        summary = "🔴 فرق كبير!\n" + "\n".join(parts)
+        return {"status": "major_diff", "discrepancies": discrepancies, "summary": "🔴 فرق كبير!\n" + "\n".join(parts)}
     elif has_minor:
-        status = "minor_diff"
-        summary = "🟡 فرق بسيط في الأرقام - تأكد من التحديث"
+        return {"status": "minor_diff", "discrepancies": discrepancies, "summary": "🟡 فرق بسيط في الأرقام - تأكد من التحديث"}
     else:
-        status = "match"
-        summary = "✅ الأرقام متطابقة"
-
-    return {"status": status, "discrepancies": discrepancies, "summary": summary}
+        return {"status": "match", "discrepancies": discrepancies, "summary": "✅ الأرقام متطابقة"}
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 4. ANOMALY DETECTION
+# ANOMALY DETECTION
 # ══════════════════════════════════════════════════════════════════════
 
 def detect_anomalies(history: list[dict]) -> list[str]:
@@ -611,15 +746,9 @@ def detect_anomalies(history: list[dict]) -> list[str]:
 
     anomalies = []
 
-    # Collect numeric values
-    spends = [_safe_num(r.get("Spend اليوم")) for r in history]
-    spends = [s for s in spends if s is not None]
-
-    orders_list = [_safe_num(r.get("Orders اليوم")) for r in history]
-    orders_list = [o for o in orders_list if o is not None]
-
-    cpos = [_safe_num(r.get("CPO اليوم")) for r in history]
-    cpos = [c for c in cpos if c is not None]
+    spends = [s for s in (_safe_num(r.get("Spend اليوم")) for r in history) if s is not None]
+    orders_list = [o for o in (_safe_num(r.get("Orders اليوم")) for r in history) if o is not None]
+    cpos = [c for c in (_safe_num(r.get("CPO اليوم")) for r in history) if c is not None]
 
     # Spend spike/drop (>30% from average)
     if len(spends) >= 3:
@@ -653,32 +782,24 @@ def detect_anomalies(history: list[dict]) -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 5. CROSS-TEAM INTELLIGENCE - ranking & comparison
+# CROSS-TEAM RANKING
 # ══════════════════════════════════════════════════════════════════════
 
 def rank_teams(all_data: list[dict]) -> dict:
-    """
-    Rank all teams by performance.
-    Returns: {by_cpo: [...], by_spend: [...], best, worst, summary}
-    """
+    """Rank all teams by CPO performance."""
     team_scores = {}
-
     for team_name, info in TEAM_INFO.items():
         sheet_name = info["sheet_name"]
-        # Find latest row for this team
         team_row = None
         for row in reversed(all_data):
             if row.get("المجموعة") == sheet_name:
                 team_row = row
                 break
-
         if not team_row:
             continue
-
         spend = _safe_num(team_row.get("Spend اليوم"))
         orders = _safe_num(team_row.get("Orders اليوم"))
         cpo = _safe_num(team_row.get("CPO اليوم"))
-
         team_scores[team_name] = {
             "leader": info["leader"],
             "spend": spend or 0,
@@ -689,7 +810,6 @@ def rank_teams(all_data: list[dict]) -> dict:
     if not team_scores:
         return {"by_cpo": [], "best": None, "worst": None, "summary": ""}
 
-    # Sort by CPO (lower is better), exclude teams with no CPO
     with_cpo = {k: v for k, v in team_scores.items() if v["cpo"] is not None and v["cpo"] > 0}
     by_cpo = sorted(with_cpo.items(), key=lambda x: x[1]["cpo"])
 
@@ -712,35 +832,31 @@ def rank_teams(all_data: list[dict]) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 6. TEAM CONTEXT BUILDER - the brain
+# TEAM CONTEXT BUILDER
 # ══════════════════════════════════════════════════════════════════════
 
 async def build_team_context(team_name: str, all_data: list[dict] | None = None) -> dict:
-    """
-    Build rich context for any team analysis.
-    Uses team's OWN sheet as primary source, falls back to master sheet.
-    """
+    """Build rich context for any team analysis."""
     if all_data is None:
         all_data = await fetch_master_data()
 
     leader = get_leader(team_name)
 
-    # PRIMARY: Try to read team's own sheet first
+    # PRIMARY: team's own sheet
     team_sheet_rows = await fetch_team_sheet(team_name)
     team_sheet_today = get_team_sheet_today(team_sheet_rows) if team_sheet_rows else None
 
-    # FALLBACK: Master sheet data
+    # SECONDARY: master sheet
     today_data = get_team_today_data(all_data, team_name)
     history = get_team_history(all_data, team_name, days=7)
     anomalies = detect_anomalies(history)
     rankings = rank_teams(all_data)
     conversation = get_recent_context(team_name)
 
-    # Calculate trend
+    # Trend calculation
     trend = "unknown"
     if len(history) >= 3:
-        cpos = [_safe_num(r.get("CPO اليوم")) for r in history[-3:]]
-        cpos = [c for c in cpos if c is not None]
+        cpos = [c for c in (_safe_num(r.get("CPO اليوم")) for r in history[-3:]) if c is not None]
         if len(cpos) >= 2:
             if cpos[-1] < cpos[0]:
                 trend = "improving"
@@ -757,7 +873,7 @@ async def build_team_context(team_name: str, all_data: list[dict] | None = None)
                 rank_position = i + 1
                 break
 
-    # MTD data
+    # MTD row
     mtd_row = None
     sheet_name = get_sheet_name(team_name)
     for row in all_data:
@@ -768,8 +884,8 @@ async def build_team_context(team_name: str, all_data: list[dict] | None = None)
         "team_name": team_name,
         "leader": leader,
         "today": today_data,
-        "team_sheet_today": team_sheet_today,  # from team's own sheet (primary)
-        "team_sheet_rows": team_sheet_rows,     # all rows from team sheet
+        "team_sheet_today": team_sheet_today,
+        "team_sheet_rows": team_sheet_rows,
         "history": history,
         "trend": trend,
         "anomalies": anomalies,
@@ -792,22 +908,20 @@ def format_context_for_prompt(ctx: dict) -> str:
     parts.append(f"## فريق: {team} | التيم ليدر: {leader}")
     parts.append(f"التاريخ: {_now_egypt().strftime('%Y-%m-%d %H:%M')}")
 
-    # Rank
     if ctx["rank"]:
         parts.append(f"الترتيب: #{ctx['rank']} من {ctx['total_teams']} فرق (بالـ CPO)")
         parts.append(f"{ctx['rankings_summary']}")
 
-    # Trend
     trend_emoji = {"improving": "📈 بيتحسن", "declining": "📉 بيوحش", "stable": "➡️ مستقر"}.get(ctx["trend"], "❓")
     parts.append(f"الاتجاه: {trend_emoji}")
 
-    # Team's own sheet data (PRIMARY source)
+    # Team's own sheet data
     team_sheet = ctx.get("team_sheet_today")
     if team_sheet:
         parts.append("\n## بيانات شيت الفريق (المصدر الأساسي):")
         parts.append(format_team_sheet_data(team_sheet))
 
-    # Master sheet data (SECONDARY/fallback)
+    # Master sheet data
     today = ctx.get("today")
     if today:
         parts.append("\n## بيانات الشيت المجمع:")
@@ -849,18 +963,19 @@ def format_context_for_prompt(ctx: dict) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SYSTEM PROMPT - Performance Marketing Manager
+# SYSTEM PROMPT
 # ══════════════════════════════════════════════════════════════════════
 
 SYSTEM_PROMPT = """أنت "EcoBot" - مدير تسويق رقمي مصري + محلل بيانات + محلل كريتف.
-لسه بتتعلم كل يوم ومعترف بده - بتسأل عشان تفهم مش عشان تحكم.
+شخصيتك مصرية دمها خفيف وعملية. بتتكلم بالعربي المصري زي ما الناس بتتكلم.
 
 ## أدوارك الثلاثة:
+
 ### 1. مدير Performance Marketing:
 - بتحلل KPIs (CPO, CPA, Cost per Message) وبتقارن بين الفرق
 - بتراجع البادجيت وتوزيعه وبتقترح تحسينات
 - بتتابع الحملات وبتنبّه لو في مشكلة أو فرصة
-- بتفهم إن الحملات دي **Facebook Messages Ads** (مش Conversions)
+- الحملات **Facebook Messages Ads** (مش Conversions)
   → الهدف: رسائل من الجمهور في الكويت (مقيمين من كل الجنسيات)
   → Flow: إعلان → رسالة → طلب → تسليم
   → متقولش "conversions" أو "purchases" - قول "رسائل" أو "طلبات"
@@ -868,127 +983,158 @@ SYSTEM_PROMPT = """أنت "EcoBot" - مدير تسويق رقمي مصري + م�
 ### 2. محلل Creative:
 - بتحلل الفيديوهات والصور الإعلانية
 - بتقيّم: Hook, CTA, التصميم, النص, الصوت
-- بتربط جودة الـ Creative بالنتائج: "الـ CPO طلع عشان الـ Hook ضعيف"
-- بتسأل أسئلة ذكية: "جربتوا فيديو بـ voiceover عربي بدل إنجليزي؟"
+- بتربط جودة الـ Creative بالنتائج
+- بتسأل أسئلة ذكية
 
 ### 3. محلل بيانات (Data Analyst):
-- بتحلل Trends: "الـ CPO بيتحسن آخر 3 أيام"
-- بتكتشف Anomalies: "ليه الـ Spend نزل 40% فجأة؟"
+- بتحلل Trends وبتكتشف Anomalies
 - بتعمل تقارير ذكية مش أرقام جافة
-- بتقدم رؤى استراتيجية: "لو زودتوا البادجيت 20% هتجيبوا 30 طلب زيادة بنفس الـ CPO"
+- بتقدم رؤى استراتيجية
 
 ## شخصيتك:
-- مصري دمه خفيف وعملي - بتتكلم زي ما الناس بتتكلم مش زي الآلات
-- متواضع - بتقول "أنا شايف" و"ممكن أكون غلطان" مش "الأرقام بتقول"
-- بتشجع وتمدح لما الشغل كويس - مش بس بتنتقد
+- مصري دمه خفيف وعملي
+- متواضع - بتقول "أنا شايف" و"ممكن أكون غلطان"
+- بتشجع وتمدح لما الشغل كويس
 - لما مش متأكد بتسأل بدل ما تفترض
-- بتخاطب كل واحد باسمه وبتعامله كزميل مش كموظف
+- بتخاطب كل واحد باسمه وبتعامله كزميل
 
 ## طريقة كلامك:
-- دايماً ابدأ بـ "أنا شايف إن..." أو "من اللي قدامي..." مش حقائق مطلقة
+- دايماً ابدأ بـ "أنا شايف إن..." أو "من اللي قدامي..."
+- بعد أي تحليل: اسأل "صح كده؟" أو "إيه رأيك؟"
 - لو في فرق في الأرقام: "أنا شايف رقم كذا في الشيت بس الصورة بتقول كذا - أنهي الصح؟"
 - لو الأداء كويس: "برافو يا [اسم]! CPO تحفة 💪"
 - لو في مشكلة: "يا [اسم] أنا ملاحظ حاجة... الـ CPO طالع شوية. إيه رأيك؟"
-- لو مش فاهم حاجة: "ممكن توضحلي الصورة دي؟ أنا مش متأكد فهمتها صح"
-- خلّي كلامك قصير وطبيعي - زي ما بتكلم زميلك على واتساب
+- خلّي كلامك قصير وطبيعي
 
 ## فهمك للأرقام (مهم جداً):
 - **CPO** = Spend اليوم ÷ New Orders اليوم (سعر الطلب قبل التسليم)
-- **CPA** = Spend أمس (الصف السابق) ÷ Delivered المسجّلة النهاردة (السعر الحقيقي - الأهم)
-  مثال: يوم 20 صرف 3000 جاب 25 طلب → CPO=120. يوم 21 اتسلم 12 بس → CPA=250
+- **CPA** = Spend أمس (الصف السابق في الشيت) ÷ Delivered المسجّلة النهاردة
+  مثال: يوم 20 صرف 3000 → يوم 21 اتسلم 12 → CPA = 3000÷12 = 250
   الـ CPA المكتوب في صف يوم 21 = أداء يوم 20 فعلياً
-- **CPA الشهر** = إجمالي Spend ÷ إجمالي Delivered (الصورة الكبيرة)
+- **CPA الشهر (MTD)** = إجمالي Spend الشهر ÷ إجمالي Delivered الشهر
 - CPO/CPA: 🟢 ≤ 150 | 🟡 ≤ 180 | 🔴 > 180
 - Cancel% ≥ 30% = 🔴 مشكلة
 - كل المبالغ بالجنيه المصري
+
+## طرق الدفع:
+- Fawry: شحن رصيد prepaid (الإعلانات بتسحب منه يوم بيوم)
+- Bank Card: دفع مباشر ببطاقة
+- Budget = رصيد prepaid أو فاتورة invoice بالكارت
 
 ## قواعد:
 - رد بالعربي المصري دايماً
 - مختصر (3-5 سطور ماكس)
 - لو كل حاجة تمام: سطرين مدح وسؤال خفيف
 - متفترضش مشاكل من عندك
-- لو الشيت فاضي: ده عادي ممكن لسه محدش حدّثه - متقلقش
+- لو الشيت فاضي: ده عادي - متقلقش
 - لو بتحلل Creative: اربطه بالأداء دايماً
-- لو شايف فرصة لتحسين: قولها كاقتراح مش أمر"""
+- لو شايف فرصة لتحسين: قولها كاقتراح مش أمر
+- اختم بـ "صح كده؟" أو سؤال بسيط"""
 
 
 # ══════════════════════════════════════════════════════════════════════
-# IMAGE CLASSIFICATION - understand what was sent before acting
+# IMAGE DATA EXTRACTION (replaces classify_image)
+# User already selected type via buttons - we just extract numbers
 # ══════════════════════════════════════════════════════════════════════
 
-# Valid image types the bot understands
-IMAGE_TYPES = {
-    "fb_ads_dashboard":  "داشبورد حملات Facebook Ads Manager (campaigns, ad sets, spend, results)",
-    "tt_ads_dashboard":  "داشبورد حملات TikTok Ads (campaigns, spend, conversions)",
-    "fb_payment":        "صفحة دفع/billing/payment من فيسبوك (فواتير، prepaid، payment activity)",
-    "tt_payment":        "صفحة دفع/billing/payment من تيك توك (فواتير، prepaid، payment activity)",
-    "order_sheet":       "شيت الطلبات اليومي (Google Sheets) فيه طلبات وأرقام",
-    "budget_sheet":      "شيت البادجيت أو أكواد فوري",
-    "creative_image":    "إعلان (صورة/فيديو creative) مصممة للنشر",
-    "other":             "صورة تانية مش مرتبطة بالتقارير",
-}
-
-# Which types count as report screenshots
-REPORT_IMAGE_TYPES = {"fb_ads_dashboard", "tt_ads_dashboard", "order_sheet", "budget_sheet"}
-# Which types are payment/billing (acknowledge only)
-PAYMENT_IMAGE_TYPES = {"fb_payment", "tt_payment"}
-
-
-async def classify_image(image_bytes: bytes) -> dict:
+async def extract_image_data(image_bytes: bytes, image_type: str, platform: str = "") -> dict:
     """
-    Step 1: Classify the image BEFORE doing anything else.
-    Returns: {type, confidence, description, platform}
+    Extract numbers/data from an image based on KNOWN type (user selected via button).
+    Also does sanity check - flags if image doesn't match selected type.
     """
     if not CLAUDE_API_KEY:
-        return {"type": "other", "confidence": 0, "description": ""}
+        return {"error": "Claude API key not configured"}
 
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    prompt = """أنت خبير في التسويق الرقمي. شوف الصورة دي وحدد نوعها بدقة.
+    # Build extraction prompt based on known type
+    if image_type in ("fb_ads_dashboard", "tt_ads_dashboard"):
+        extract_prompt = """استخرج كل الأرقام من داشبورد الإعلانات ده.
 
 رد بـ JSON فقط:
 {
-  "type": "...",
-  "confidence": 0.0,
-  "platform": "facebook|tiktok|google_sheets|other",
-  "description": "وصف قصير لمحتوى الصورة بالعربي"
+  "spend": null,
+  "orders": null,
+  "results": null,
+  "impressions": null,
+  "clicks": null,
+  "ctr": null,
+  "cpo": null,
+  "budget": null,
+  "platform": null,
+  "account_name": null,
+  "campaign_names": [],
+  "date_range": null,
+  "notes": "",
+  "sanity_check": "ok"
 }
 
-## الأنواع - اختار واحد بس:
+- لو الأرقام تراكمية (MTD): اكتب في notes "MTD totals"
+- لو الصورة مش داشبورد إعلانات: حط sanity_check = "wrong_type" واكتب النوع الصح في notes
+- لو شايف أكتر من حملة: اجمع الأرقام"""
 
-### داشبوردات الإعلانات (فيها حملات وأرقام أداء):
-- "fb_ads_dashboard" = صفحة Facebook Ads Manager فيها قائمة حملات campaigns أو ad sets مع أرقام أداء (spend, results, impressions, reach, CPC, CPM). بتبان فيها جدول الحملات وأسماءها وحالتها (active/paused).
-- "tt_ads_dashboard" = صفحة TikTok Ads Manager فيها حملات أو ad groups مع أرقام (cost, conversions, impressions). شكل TikTok مختلف عن فيسبوك.
+    elif image_type in ("fb_payment", "tt_payment"):
+        extract_prompt = """استخرج بيانات الدفع من الصورة دي.
 
-### صفحات الدفع/الفواتير (مش فيها حملات - فيها فلوس ودفع):
-- "fb_payment" = صفحة billing أو payment settings أو payment activity من فيسبوك. بتبان فيها: invoices, payment method, prepaid balance, transactions, أو "Paid" status. مفيهاش حملات.
-- "tt_payment" = صفحة billing أو payment من تيك توك. بتبان فيها: balance, top up, transactions, payment history. مفيهاش حملات.
+رد بـ JSON فقط:
+{
+  "amount": null,
+  "payment_type": null,
+  "status": null,
+  "date": null,
+  "platform": null,
+  "account_name": null,
+  "balance": null,
+  "transactions": [],
+  "notes": "",
+  "sanity_check": "ok"
+}
 
-### شيتات (Google Sheets):
-- "order_sheet" = شيت Google Sheets فيه جدول طلبات يومية (تاريخ، طلبات، delivered، cancel، hold). بيبان عليه شكل Google Sheets.
-- "budget_sheet" = شيت بادجيت أو أكواد فوري أو رصيد. بيبان عليه شكل Google Sheets.
+payment_type: "prepaid" / "card" / "manual" / "invoice"
+status: "paid" / "failed" / "pending" / "funded"
+- لو في أكتر من معاملة: حطهم في transactions
+- لو الصورة مش صفحة دفع: حط sanity_check = "wrong_type"
+- لو في دفعة Failed: اكتبها في notes"""
 
-### غيره:
-- "creative_image" = صورة إعلان أو creative مصممة (صورة منتج، عرض، بانر). مش screenshot من منصة.
-- "other" = أي حاجة تانية مش من اللي فوق.
+    elif image_type in ("order_sheet", "budget_sheet"):
+        extract_prompt = """استخرج الأرقام من شيت الطلبات ده.
 
-## الفرق المهم:
-- صفحة الدفع (payment/billing) ≠ داشبورد الحملات (campaigns)
-- صفحة الدفع بتبين فواتير ومبالغ مدفوعة - مفيهاش أسماء حملات أو نتائج إعلانية
-- داشبورد الحملات بتبين campaigns وأرقام أداء (spend, results, impressions)
-- لو الصورة فيها كلمة "Payment" أو "Billing" أو "Invoice" أو "Prepaid" = payment
-- لو الصورة فيها كلمة "Campaigns" أو "Ad Sets" أو "Results" أو "Impressions" = dashboard"""
+رد بـ JSON فقط:
+{
+  "spend": null,
+  "orders": null,
+  "delivered": null,
+  "cancel": null,
+  "hold": null,
+  "cpo": null,
+  "date": null,
+  "notes": "",
+  "sanity_check": "ok"
+}
+
+- لو الصورة مش شيت: حط sanity_check = "wrong_type"
+- اقرأ آخر صف فيه بيانات"""
+
+    else:
+        extract_prompt = """وصف محتوى الصورة دي باختصار.
+
+رد بـ JSON فقط:
+{
+  "description": "",
+  "notes": "",
+  "sanity_check": "ok"
+}"""
 
     try:
         client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
         message = await client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=200,
+            max_tokens=600,
             messages=[{
                 "role": "user",
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": extract_prompt},
                 ],
             }],
         )
@@ -999,73 +1145,56 @@ async def classify_image(image_bytes: bytes) -> dict:
             response_text = response_text.rsplit("```", 1)[0].strip()
 
         result = json.loads(response_text)
-        confidence = result.get("confidence", 0)
-        # Normalize: Claude might return 0-100 instead of 0-1
-        if isinstance(confidence, (int, float)) and confidence > 1:
-            confidence = confidence / 100
-        result["confidence"] = confidence
-        description = result.get("description", "")
+        result["image_type"] = image_type
+        result["_extracted"] = True
 
-        # Check if learned patterns override the classification
-        learned = check_learned_patterns(description)
-        if learned and confidence < 0.8:
-            logger.info("Learned pattern override: %s -> %s", result.get("type"), learned)
-            result["type"] = learned
-            result["confidence"] = 0.85
-            result["_learned"] = True
+        # Sanity check: if image doesn't match selected type
+        if result.get("sanity_check") == "wrong_type":
+            result["_type_mismatch"] = True
+            logger.warning("Image type mismatch: user said %s but image looks different", image_type)
 
-        # Mark low confidence for the bot to ask
-        result["_low_confidence"] = confidence < 0.7
-
-        logger.info("Image classified as: %s (%.0f%%)", result.get("type"), confidence * 100)
+        logger.info("Extracted data from %s image: %s", image_type, {k: v for k, v in result.items() if not k.startswith("_") and v})
         return result
 
+    except json.JSONDecodeError:
+        logger.error("JSON parse error from image extraction")
+        return {"error": "parse_failed", "image_type": image_type, "_raw": response_text}
     except Exception as e:
-        logger.error("Image classification error: %s", e)
-        return {"type": "other", "confidence": 0, "description": str(e), "_low_confidence": True}
+        logger.error("Image extraction error: %s", e)
+        return {"error": str(e), "image_type": image_type}
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SCREENSHOT ANALYSIS - classify first, then extract
+# SCREENSHOT ANALYSIS - extract + compare with sheet
 # ══════════════════════════════════════════════════════════════════════
 
 async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: str) -> dict:
     """
-    Smart screenshot analysis:
-    1. Classify the image type
-    2. Extract relevant data based on type
-    3. Return structured result with image_type field
+    Screenshot analysis:
+    1. For sheets: read sheet directly (more accurate than OCR)
+    2. For dashboards: extract numbers from image
+    3. For payments: extract payment details
     """
     if not CLAUDE_API_KEY:
         return {"error": "Claude API key not configured"}
 
-    # Step 1: Classify the image
-    classification = await classify_image(image_bytes)
-    img_type = classification.get("type", "other")
-    img_desc = classification.get("description", "")
+    image_type = report_type  # In V2, report_type IS the image_type (user selected)
 
-    # For non-report images, return early with classification info
-    if img_type not in REPORT_IMAGE_TYPES:
-        return {
-            "image_type": img_type,
-            "description": img_desc,
-            "platform": classification.get("platform", ""),
-            "notes": img_desc,
-            "_classified": True,
-        }
+    # For non-report images, use extract_image_data
+    if image_type not in REPORT_IMAGE_TYPES:
+        return await extract_image_data(image_bytes, image_type)
 
-    # Step 2: For Google Sheets screenshots, read the sheet DIRECTLY instead of from image
-    if img_type in ("order_sheet", "budget_sheet"):
+    # For Google Sheets screenshots, read the sheet DIRECTLY
+    if image_type in ("order_sheet", "budget_sheet"):
         team_rows = await fetch_team_sheet(team_name)
         today_row = get_team_sheet_today(team_rows) if team_rows else None
         if today_row:
             spend = _safe_num(today_row.get("Spend", ""))
             orders = _safe_num(today_row.get("New Orders", ""))
             cpo = _safe_num(today_row.get("CPO", ""))
-            # Calculate CPA correctly from sheet rows
             cpa = calculate_cpa_from_sheet(team_rows)
             return {
-                "image_type": img_type,
+                "image_type": image_type,
                 "spend": spend,
                 "orders": orders,
                 "cpo": cpo,
@@ -1077,163 +1206,14 @@ async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: st
                 "notes": "تم قراءة الأرقام من الشيت مباشرة",
                 "_from_sheet": True,
             }
-        # If can't read sheet directly, return basic result - DON'T extract MTD totals from image
-        logger.warning("Could not read team sheet for %s, returning basic classification", team_name)
-        return {
-            "image_type": img_type,
-            "description": img_desc,
-            "notes": "مش قادر أقرأ الشيت مباشرة - هبص على الصورة",
-            "_sheet_read_failed": True,
-        }
+        logger.warning("Could not read team sheet for %s, falling back to image extraction", team_name)
 
-    # Step 3: Extract numbers from image (for ads dashboards)
-    leader = get_leader(team_name)
-
-    prompt = f"""أنت بتراجع screenshot من فريق {team_name} (التيم ليدر: {leader}).
-نوع الصورة: {img_type} ({img_desc})
-نوع التقرير: {report_type}
-
-استخرج كل الأرقام اللي تقدر تشوفها في الصورة دي.
-كل المبالغ بالجنيه المصري.
-
-رد بـ JSON فقط بالشكل ده (حط null لأي رقم مش موجود):
-{{
-  "spend": null,
-  "orders": null,
-  "results": null,
-  "delivered": null,
-  "cancel": null,
-  "hold": null,
-  "cpo": null,
-  "cpa": null,
-  "budget": null,
-  "impressions": null,
-  "clicks": null,
-  "ctr": null,
-  "platform": null,
-  "account_name": null,
-  "campaign_names": [],
-  "date": null,
-  "notes": ""
-}}
-
-ملاحظات:
-- لو الصورة فيها أكتر من حملة، اجمع الأرقام
-- لو شايف حاجة غريبة اكتبها في notes"""
-
-    try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-        img_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-        )
-
-        response_text = message.content[0].text
-        cleaned = response_text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1]
-            cleaned = cleaned.rsplit("```", 1)[0].strip()
-
-        result = json.loads(cleaned)
-        result["_raw"] = response_text
-        result["image_type"] = img_type
-        result["_low_confidence"] = classification.get("_low_confidence", False)
-        return result
-
-    except json.JSONDecodeError:
-        return {"error": "parse_failed", "image_type": img_type, "_raw": response_text}
-    except Exception as e:
-        logger.error("Claude API error: %s", e)
-        return {"error": str(e), "image_type": img_type}
+    # For ads dashboards or failed sheet read: extract from image
+    return await extract_image_data(image_bytes, image_type)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SMART RESPONSE FOR NON-REPORT IMAGES
-# ══════════════════════════════════════════════════════════════════════
-
-async def handle_non_report_image(
-    image_bytes: bytes, team_name: str, image_type: str, description: str
-) -> str:
-    """
-    Smart response for payment receipts, creatives, and other non-report images.
-    Instead of trying to extract ads numbers, respond appropriately.
-    """
-    if not CLAUDE_API_KEY:
-        return ""
-
-    leader = get_leader(team_name)
-    img_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    # Payment instructions - detailed reading
-    payment_instruction = f"""الصورة دي صفحة دفع/billing. اقرأها بعناية واستخرج كل التفاصيل:
-
-## المطلوب تحديده:
-1. **المنصة**: فيسبوك ولا تيك توك؟ (شوف شكل الصفحة والـ logo)
-2. **المبلغ**: كام بالظبط؟ اقرأ كل الأرقام الظاهرة
-3. **نوع الدفع**:
-   - Prepaid balance = شحن رصيد من فوري (الإعلانات بتسحب منه يوم بيوم)
-   - Credit/Debit Card = دفع ببطاقة
-   - Manual payment = دفع يدوي
-4. **الحالة**: Paid (تم) / Failed (فشل) / Funded (اتمول) / Pending (معلق)
-5. **التاريخ**: تاريخ آخر معاملة
-
-## شكل الرد (3-4 سطور):
-"يا {leader}، أنا شايف دي فواتير إعلانات [فيسبوك/تيك توك]:
-- آخر دفعة: [المبلغ] جنيه [شحن رصيد/بطاقة] بتاريخ [التاريخ] - [الحالة]
-- [لو في Failed: ⚠️ في دفعة فاشلة لازم تتحل]
-- [لو في معاملات تانية مهمة اذكرها]"
-
-مهم: لو في دفعة Failed = مشكلة لازم تتنبه ليها
-خاطب {leader} بالاسم. بالعربي المصري."""
-
-    type_instructions = {
-        "fb_payment": payment_instruction,
-        "tt_payment": payment_instruction,
-
-        "creative_image": "__USE_FULL_CREATIVE_ANALYSIS__",
-
-        "other": f"""رد بسطر واحد: "تم استلام الصورة ✅"
-متحللش ومتسألش.
-خاطب {leader} بالاسم.""",
-    }
-
-    prompt = type_instructions.get(image_type, type_instructions["other"])
-
-    # Creative images get full scorecard analysis
-    if prompt == "__USE_FULL_CREATIVE_ANALYSIS__":
-        return await analyze_image_creative(image_bytes, team_name)
-
-    try:
-        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
-        message = await client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=300,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                {"type": "text", "text": prompt},
-            ]}],
-        )
-        response = message.content[0].text.strip()
-        remember_exchange(team_name, response)
-        return response
-
-    except Exception as e:
-        logger.error("Non-report image analysis error: %s", e)
-        return ""
-
-
-# ══════════════════════════════════════════════════════════════════════
-# SMART ANALYSIS - the core intelligence
+# SMART ANALYSIS - the core intelligence engine
 # ══════════════════════════════════════════════════════════════════════
 
 async def smart_analysis(
@@ -1260,7 +1240,7 @@ async def smart_analysis(
     ctx = await build_team_context(team_name, all_data)
     context_text = format_context_for_prompt(ctx)
 
-    # ── Team sheet data (PRIMARY source for comparison) ──
+    # Team sheet data (PRIMARY source)
     team_sheet = ctx.get("team_sheet_today")
     team_sheet_rows = ctx.get("team_sheet_rows", [])
     team_sheet_recent = get_team_sheet_recent(team_sheet_rows, 5)
@@ -1290,19 +1270,18 @@ async def smart_analysis(
         for r in team_sheet_recent:
             ts_text += f"  {r.get('Date','?')}: Spend={r.get('Spend','-')} | Orders={r.get('New Orders','-')} | CPO={r.get('CPO','-')} | {r.get('Lamp','')}\n"
 
-    # Check if screenshot numbers look like MTD totals (much bigger than daily)
+    # Check if screenshot numbers look like MTD totals
     ss_spend = _safe_num(screenshot_data.get("spend"))
     ts_spend = _safe_num(team_sheet.get("Spend", "")) if team_sheet else None
     is_mtd = False
     if ss_spend and ts_spend and ts_spend > 0 and ss_spend > ts_spend * 5:
-        # Screenshot spend is 5x+ bigger than daily = probably MTD totals
         is_mtd = True
         logger.info("Screenshot looks like MTD totals (ss=%s vs daily=%s)", ss_spend, ts_spend)
 
-    # Get learnings for this team
+    # Get learnings
     learnings_text = get_learnings_for_prompt(team_name)
 
-    # Cross-day intelligence: creative history
+    # Creative history
     creative_text = ""
     last_creative = get_last_creative(team_name)
     if last_creative:
@@ -1316,7 +1295,7 @@ async def smart_analysis(
         for btype, amount in budget_today["by_type"].items():
             budget_text += f"  {btype}: {amount:,.0f}\n"
 
-    # Verify screenshot vs team sheet (skip if MTD)
+    # Verify screenshot vs team sheet
     if is_mtd:
         verification = {"status": "mtd_totals", "discrepancies": [], "summary": "📊 الأرقام دي MTD (تراكمي الشهر) مش أرقام اليوم"}
     else:
@@ -1329,7 +1308,6 @@ async def smart_analysis(
             }
         elif ctx.get("today"):
             verify_source = ctx["today"]
-
         verification = verify_screenshot_vs_sheet(screenshot_data, verify_source)
 
     # Screenshot data section
@@ -1340,7 +1318,7 @@ async def smart_analysis(
         ss_parts.append(f"  {k}: {v}")
     ss_text = "\n".join(ss_parts)
 
-    # ── Build the analysis prompt ──
+    # Build the analysis prompt based on verification status
     if verification["status"] == "major_diff":
         analysis_prompt = f"""## فريق: {team_name} | التيم ليدر: {leader}
 
@@ -1352,11 +1330,12 @@ async def smart_analysis(
 
 ## المطلوب:
 {leader} كاتب في الشيت أرقام مختلفة عن اللي في الـ screenshot:
-- وضّح بالظبط أنهي رقم مختلف (الشيت بيقول X والـ screenshot بيقول Y)
+- وضّح بالظبط أنهي رقم مختلف
 - اسأله: "أنهي الرقم الصح؟ الشيت ولا الـ screenshot؟"
-- لو الفرق كبير اطلب يبعت screenshot تاني أو يعدّل الشيت
+- ابدأ بـ "أنا شايف إن..."
+- اختم بـ "صح كده؟"
 
-قواعد: خاطب {leader} بالاسم. مختصر (3-5 سطور). بالعربي المصري. متزعلوش."""
+خاطب {leader} بالاسم. مختصر (3-5 سطور). بالعربي المصري."""
 
     elif verification["status"] == "mtd_totals":
         analysis_prompt = f"""## فريق: {team_name} | التيم ليدر: {leader}
@@ -1365,14 +1344,12 @@ async def smart_analysis(
 {ts_text}
 
 ## ملاحظة: الأرقام في الـ screenshot دي تراكمية (MTD) مش أرقام يوم واحد.
-الـ screenshot بيقول: Spend={screenshot_data.get('spend','-')} | Orders={screenshot_data.get('orders') or screenshot_data.get('results','-')}
-شيت الفريق آخر يوم: Spend={team_sheet.get('Spend','-') if team_sheet else '?'} | Orders={team_sheet.get('New Orders','-') if team_sheet else '?'}
 
 ## المطلوب:
 - وضّح إن الأرقام دي تراكمي الشهر مش أرقام اليوم
 - احسب الـ CPO التراكمي وقيّمه
 - قارن مع أرقام آخر يوم في الشيت
-- لو الأداء كويس: امدح. لو محتاج يتحسن: نصيحة واحدة
+- ابدأ بـ "أنا شايف إن..." واختم بـ "صح كده؟"
 
 خاطب {leader} بالاسم. مختصر (3-4 سطور). بالعربي المصري."""
 
@@ -1383,12 +1360,11 @@ async def smart_analysis(
 {ts_text}
 
 ## المطلوب:
-الشيت لسه مش متحدث لليوم ده. حلل الأرقام اللي في الـ screenshot بس:
+الشيت لسه مش متحدث. حلل الأرقام اللي في الـ screenshot بس:
 - لو فيها spend و orders: احسب الـ CPO وقيّمه
-- قول ملاحظة مفيدة واحدة بس
-- لو الأرقام كويسة: امدح باختصار
+- ابدأ بـ "أنا شايف إن..." واختم بـ "صح كده؟"
 
-قواعد: خاطب {leader} بالاسم. مختصر (2-3 سطور). بالعربي المصري."""
+خاطب {leader} بالاسم. مختصر (2-3 سطور). بالعربي المصري."""
 
     else:
         analysis_prompt = f"""## فريق: {team_name} | التيم ليدر: {leader}
@@ -1403,39 +1379,30 @@ async def smart_analysis(
 ## نتيجة المقارنة: {verification['summary']}
 
 ## المطلوب - حلل كـ Performance Marketing Manager + Data Analyst:
-ابدأ بـ "أنا شايف إن..." وحلل بناءً على الصورة + شيت الفريق + التريند:
+ابدأ بـ "أنا شايف إن..." وحلل:
 
 ### كمدير بيرفورمانس:
 - قيّم الأداء: CPO/CPA كويس ولا محتاج تحسين؟
-- لو الـ CPO > 150: إيه الممكن يتعمل؟ (تغيير creative؟ تعديل targeting؟ تقليل بادجيت؟)
-- لو الـ Cancel عالي: يبقى في مشكلة في جودة الطلبات أو الـ audience
-- قارن مع ترتيب الفريق وسط باقي الفرق لو البيانات متاحة
+- لو CPO > 150: إيه الممكن يتعمل؟
+- لو Cancel عالي: في مشكلة في جودة الطلبات
+- قارن مع ترتيب الفريق
 
 ### كمحلل بيانات:
-- شوف الـ Trend: الأداء بيتحسن ولا بيوحش ولا مستقر؟
-- لو في anomaly (ارتفاع/انخفاض مفاجئ): نبّه عليه
-- لو عندك بيانات كافية: ادي insight واحد مفيد
-- لو في creative history: اربط بين تغيير الـ creative والأداء
-
-### كمحلل Creative:
-- لو الـ CPO > 200: اطلب من التيم ليدر يبعت الـ Creative الحالي عشان تحلله
-- لو في creative history وبعده الأداء اتحسن: امدح التغيير
-- لو في creative history وبعده الأداء وحش: اقترح تغيير
+- Trend: الأداء بيتحسن ولا بيوحش؟
+- لو في anomaly: نبّه عليه
+- لو في creative history: اربط بين الـ creative والأداء
 
 ### قواعد:
-- ابدأ بـ "أنا شايف" مش حقائق مطلقة
+- ابدأ بـ "أنا شايف إن..."
+- اختم بـ "صح كده؟" أو سؤال بسيط
 - خاطب {leader} بالاسم
 - مختصر (4-6 سطور)
-- حلل بس اللي قدامك - متفترضش مشاكل
-- لو حد صحّحلك قبل كده (في التصحيحات السابقة) - خد بالك منها
-- لو كل حاجة تمام: امدح + نصيحة خفيفة واحدة
 - بالعربي المصري"""
 
     try:
-        client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
 
         messages_content = [{"type": "text", "text": analysis_prompt}]
-
         if image_bytes:
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
             messages_content.insert(0, {
@@ -1443,7 +1410,7 @@ async def smart_analysis(
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
             })
 
-        message = client.messages.create(
+        message = await client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=800,
             system=SYSTEM_PROMPT,
@@ -1451,10 +1418,7 @@ async def smart_analysis(
         )
 
         response = message.content[0].text.strip()
-
-        # Auto-remember this exchange
         remember_exchange(team_name, response)
-
         return response
 
     except Exception as e:
@@ -1463,35 +1427,82 @@ async def smart_analysis(
 
 
 # ══════════════════════════════════════════════════════════════════════
-# TEXT MESSAGE ANALYSIS - interactive conversation with memory
+# PAYMENT IMAGE HANDLER
 # ══════════════════════════════════════════════════════════════════════
 
-async def analyze_text_message(team_name: str, text: str, reply_to_text: str = "") -> str:
-    """
-    Handle text replies from team leaders with full conversation memory.
-    Smart enough to know when to just acknowledge and when to engage.
-    """
+async def handle_payment_image(image_bytes: bytes, team_name: str, image_type: str) -> str:
+    """Smart response for payment/billing screenshots."""
     if not CLAUDE_API_KEY:
         return ""
 
-    # Simple acknowledgements - just respond briefly, no analysis needed
+    leader = get_leader(team_name)
+    img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = f"""الصورة دي صفحة دفع/billing. اقرأها بعناية واستخرج كل التفاصيل:
+
+## المطلوب تحديده:
+1. **المنصة**: فيسبوك ولا تيك توك؟
+2. **المبلغ**: كام بالظبط؟
+3. **نوع الدفع**:
+   - Prepaid balance = شحن رصيد من فوري
+   - Credit/Debit Card = دفع ببطاقة
+   - Manual payment = دفع يدوي
+4. **الحالة**: Paid / Failed / Funded / Pending
+5. **التاريخ**: تاريخ آخر معاملة
+
+## شكل الرد (3-4 سطور):
+ابدأ بـ "أنا شايف إن..." ووضّح:
+- آخر دفعة: المبلغ + النوع + الحالة
+- لو في Failed: ⚠️ نبّه
+- اختم بـ "صح كده؟"
+
+مهم: لو في دفعة Failed = مشكلة لازم تتنبه ليها
+خاطب {leader} بالاسم. بالعربي المصري."""
+
+    try:
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        message = await client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=300,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text", "text": prompt},
+            ]}],
+        )
+        response = message.content[0].text.strip()
+        remember_exchange(team_name, response)
+        return response
+    except Exception as e:
+        logger.error("Payment image analysis error: %s", e)
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TEXT MESSAGE ANALYSIS
+# ══════════════════════════════════════════════════════════════════════
+
+async def analyze_text_message(team_name: str, text: str, reply_to_text: str = "") -> str:
+    """Handle text replies from team leaders with conversation memory."""
+    if not CLAUDE_API_KEY:
+        return ""
+
+    # Simple acknowledgements - don't waste API call
     simple_words = {"شكرا", "شكراً", "تمام", "اوك", "ok", "أوك", "حاضر", "ماشي",
                     "تم", "👍", "🙏", "ان شاء الله", "إن شاء الله", "هعمل كده",
                     "حسنا", "طيب", "اه", "أه", "اوكي"}
     cleaned = text.strip().replace("!", "").replace(".", "").replace("،", "")
     if cleaned in simple_words or len(cleaned) <= 4:
-        # Don't waste an API call - just acknowledge
         leader = get_leader(team_name)
-        remember_exchange(team_name, f"👍", user_reply=text)
-        return ""  # Return empty = don't reply to simple acknowledgements
+        remember_exchange(team_name, "👍", user_reply=text)
+        return ""
 
     leader = get_leader(team_name)
 
-    # For substantive messages, build context
+    # Build context for substantive messages
     all_data = await fetch_master_data()
     ctx = await build_team_context(team_name, all_data)
 
-    # Today's numbers summary
     today = ctx.get("today")
     numbers_summary = ""
     if today:
@@ -1513,21 +1524,16 @@ async def analyze_text_message(team_name: str, text: str, reply_to_text: str = "
 
 ## أنت مدير Performance Marketing + محلل بيانات + محلل Creative:
 - الحملات Facebook Messages Ads (مش conversions) - الجمهور مقيمين في الكويت
-- لو {leader} بيسأل عن استراتيجية أو تحسين: جاوبه بخبرة عملية
-- لو بيسأل عن بادجيت: ادي اقتراح مبني على الأرقام
+- لو {leader} بيسأل عن استراتيجية: جاوبه بخبرة عملية
+- لو بيسأل عن بادجيت: اقتراح مبني على الأرقام
 - لو بيسأل عن creative: انصحه بناءً على الأداء
-- لو بيسأل عن targeting: اقترح audiences مناسبة
 
 ## قواعد:
-- لو {leader} بيفسّر حاجة: اقبل تفسيره إلا لو فعلاً غير منطقي
-- متفترضش مشاكل مش موجودة
-- لو الكلام عادي ومش محتاج تحليل: رد بسطر واحد بس
-- لو بيسأل سؤال تقني: جاوبه بخبرة عملية حقيقية
-- لو بيشتكي: اسمعه واتفهمه وادي حل عملي
-- لو قال هيعمل حاجة: شجعه
+- ابدأ بـ "أنا شايف إن..." لو بتحلل
+- لو الكلام عادي: رد بسطر واحد
+- لو بيفسّر حاجة: اقبل تفسيره
 - متكررش نفس الأسئلة
-
-رد مختصر (1-3 سطور). بالعربي المصري. متبالغش."""
+- رد مختصر (1-3 سطور). بالعربي المصري."""
 
     try:
         client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
@@ -1537,11 +1543,9 @@ async def analyze_text_message(team_name: str, text: str, reply_to_text: str = "
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
-
         response = message.content[0].text.strip()
         remember_exchange(team_name, response, user_reply=text)
         return response
-
     except Exception as e:
         logger.error("Text analysis error: %s", e)
         return ""
@@ -1572,7 +1576,6 @@ def generate_quick_summary(screenshot_data: dict) -> str:
 
     if screenshot_data.get("_from_sheet"):
         return "📋 " + (" | ".join(parts) if parts else "تم استلام الصورة")
-
     return "🤖 " + (" | ".join(parts) if parts else "تم استلام الصورة")
 
 
@@ -1595,11 +1598,7 @@ def get_video_duration(video_path: str) -> float:
 
 
 def extract_video_frames(video_bytes: bytes) -> list[bytes]:
-    """
-    Extract smart frames from video:
-    - 3 frames in first 3 seconds (Hook analysis)
-    - 5 frames spread across the rest (Content + CTA)
-    """
+    """Extract smart frames: 3 in first 3s (Hook), rest spread across content."""
     frames = []
     with tempfile.TemporaryDirectory() as tmpdir:
         video_path = Path(tmpdir) / "input.mp4"
@@ -1610,13 +1609,11 @@ def extract_video_frames(video_bytes: bytes) -> list[bytes]:
             duration = 15.0
 
         timestamps = [0.5, 1.5, 3.0]
-
         remaining = max(duration - 3, 1)
         content_frames = min(5, int(remaining / 2))
         for i in range(content_frames):
             t = 3.0 + (remaining / (content_frames + 1)) * (i + 1)
             timestamps.append(min(t, duration - 0.2))
-
         if duration > 4:
             timestamps.append(duration - 0.5)
 
@@ -1655,7 +1652,6 @@ def extract_audio_transcript(video_bytes: bytes) -> str:
         try:
             result = subprocess.run(cmd, capture_output=True, timeout=30)
             if not audio_path.exists() or audio_path.stat().st_size < 1000:
-                logger.info("No audio track or too short")
                 return ""
         except Exception as e:
             logger.warning("Audio extraction failed: %s", e)
@@ -1667,8 +1663,7 @@ def extract_audio_transcript(video_bytes: bytes) -> str:
             segments, info = model.transcribe(str(audio_path), beam_size=3)
             text_parts = [seg.text.strip() for seg in segments if seg.text.strip()]
             transcript = " ".join(text_parts)
-            logger.info("Transcript (%s, %.1fs): %s",
-                        info.language, info.duration, transcript[:100])
+            logger.info("Transcript (%s, %.1fs): %s", info.language, info.duration, transcript[:100])
             return transcript
         except ImportError:
             logger.warning("faster-whisper not available")
@@ -1678,7 +1673,7 @@ def extract_audio_transcript(video_bytes: bytes) -> str:
             return ""
 
 
-# ── Creative Evaluation Scorecard ────────────────────────────────────
+# Creative Scorecard prompt
 CREATIVE_SCORECARD_PROMPT = """
 ## نظام التقييم (Scorecard):
 قيّم كل عنصر من 1-10 وادي تعليق مختصر:
@@ -1723,7 +1718,7 @@ async def analyze_video_creative(
         vp.write_bytes(video_bytes)
         duration = get_video_duration(str(vp))
 
-    # Get performance context to link creative with results
+    # Get performance context
     all_data = await fetch_master_data()
     ctx = await build_team_context(team_name, all_data)
 
@@ -1735,7 +1730,6 @@ async def analyze_video_creative(
         perf_context += f"\nالترتيب: #{ctx.get('rank', '?')} من {ctx.get('total_teams', '?')} فرق"
 
     content = []
-
     frame_labels = []
     if len(frames) >= 3:
         frame_labels = ["Hook (0.5s)", "Hook (1.5s)", "Hook (3s)"]
@@ -1764,22 +1758,20 @@ async def analyze_video_creative(
     if transcript:
         prompt_parts.append(f"\n🔊 نص الـ Voiceover/الصوت:")
         prompt_parts.append(f"\"{transcript}\"")
-        prompt_parts.append("حلل النص ده: هل مقنع؟ واضح؟ بيوصل الرسالة؟ مناسب للجمهور المستهدف؟")
+        prompt_parts.append("حلل النص ده: هل مقنع؟ واضح؟ مناسب للجمهور؟")
     else:
         prompt_parts.append("\n🔇 الفيديو ده مفيهوش voiceover واضح.")
-        prompt_parts.append("قيّم: هل الفيديو محتاج voiceover عشان يكون أقوى؟")
+        prompt_parts.append("قيّم: هل الفيديو محتاج voiceover؟")
 
     prompt_parts.append(f"\n{CREATIVE_SCORECARD_PROMPT}")
     prompt_parts.append(f"""
 ## كمحلل Creative + مدير Performance:
-- الحملات دي Facebook Messages Ads (الهدف رسائل مش conversions)
+- الحملات Facebook Messages Ads (الهدف رسائل مش conversions)
 - الجمهور: مقيمين في الكويت من كل الجنسيات
-- اربط جودة الـ Creative بالأداء:
-  * لو الـ CPO عالي: هل الـ Hook ضعيف؟ الـ CTA مش واضح؟
-  * لو الـ CPO كويس: إيه اللي مميز في الإعلان ده؟ نكرره!
-- اسأل سؤال ذكي يخلي الـ Media Buyer يفكر
-- لو الـ Voiceover بلغة معينة: مناسبة للجمهور؟
-- Trend حالي: {ctx.get('trend', '?')}
+- اربط جودة الـ Creative بالأداء
+- ابدأ بـ "أنا شايف إن..."
+- اختم بسؤال ذكي + "صح كده؟"
+- Trend: {ctx.get('trend', '?')}
 
 خاطب {leader} بالاسم. بالعربي المصري. مختصر وعملي.""")
 
@@ -1797,7 +1789,6 @@ async def analyze_video_creative(
         remember_exchange(team_name, f"[تحليل فيديو] {response[:200]}")
         save_creative_record(team_name, "video", response[:200])
         return response
-
     except Exception as e:
         logger.error("Video analysis error: %s", e)
         return ""
@@ -1811,7 +1802,6 @@ async def analyze_image_creative(image_bytes: bytes, team_name: str) -> str:
     leader = get_leader(team_name)
     img_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-    # Get performance context
     all_data = await fetch_master_data()
     ctx = await build_team_context(team_name, all_data)
 
@@ -1839,6 +1829,7 @@ async def analyze_image_creative(image_bytes: bytes, team_name: str) -> str:
 - 💡 اقتراحات التحسين (2-3)
 - 🤔 سؤال للـ Media Buyer
 
+ابدأ بـ "أنا شايف إن..." واختم بـ "صح كده؟"
 لو الأداء وحش، اربط بين جودة الإعلان والنتائج.
 خاطب {leader} بالاسم. بالعربي المصري. مختصر."""
 
@@ -1857,24 +1848,107 @@ async def analyze_image_creative(image_bytes: bytes, team_name: str) -> str:
         remember_exchange(team_name, f"[تحليل صورة] {response[:200]}")
         save_creative_record(team_name, "image", response[:200])
         return response
-
     except Exception as e:
         logger.error("Image creative analysis error: %s", e)
         return ""
 
 
 # ══════════════════════════════════════════════════════════════════════
-# PROACTIVE MONITORING - bot checks sheets and alerts on its own
+# OWNER REPORT FOR A TEAM (NEW in V2)
+# ══════════════════════════════════════════════════════════════════════
+
+async def build_owner_team_report(team_name: str) -> dict:
+    """
+    Build a report for the owner about one team's status.
+    Checks: tracking sheet + team sheet + compares.
+    Returns: {received, missing, sheet_status, recommendation, summary}
+    """
+    leader = get_leader(team_name)
+
+    # What did they send today?
+    tracking = await get_missing_for_team(team_name, "morning")
+
+    # Team sheet data
+    team_rows = await fetch_team_sheet(team_name)
+    today_row = get_team_sheet_today(team_rows) if team_rows else None
+    cpa = calculate_cpa_from_sheet(team_rows) if team_rows else None
+    recent = get_team_sheet_recent(team_rows, 5) if team_rows else []
+
+    # Sheet status
+    sheet_status = "not_updated"
+    sheet_data = {}
+    if today_row:
+        sheet_status = "updated"
+        sheet_data = {
+            "spend": _safe_num(today_row.get("Spend", "")),
+            "orders": _safe_num(today_row.get("New Orders", "")),
+            "cpo": _safe_num(today_row.get("CPO", "")),
+            "delivered": _safe_num(today_row.get("Delivered", "")),
+            "cancel": _safe_num(today_row.get("Cancel", "")),
+            "cpa": cpa,
+            "date": today_row.get("Date", ""),
+        }
+
+    # CPO evaluation
+    cpo = sheet_data.get("cpo")
+    cpo_status = "unknown"
+    if cpo:
+        if cpo <= CPO_GREEN:
+            cpo_status = "green"
+        elif cpo <= CPO_YELLOW:
+            cpo_status = "yellow"
+        else:
+            cpo_status = "red"
+
+    # Recommendation
+    recommendation = ""
+    if cpo_status == "red":
+        recommendation = f"⚠️ CPO عالي ({cpo:.0f}) - محتاج مراجعة creative أو targeting"
+    elif cpo_status == "yellow":
+        recommendation = f"🟡 CPO مقبول ({cpo:.0f}) - تابع وممكن يتحسن"
+    elif cpo_status == "green" and cpo:
+        recommendation = f"✅ أداء ممتاز (CPO={cpo:.0f}) - ممكن نزود البادجيت"
+
+    # Build summary text
+    summary_parts = [f"📊 {team_name} ({leader}):"]
+    if sheet_status == "updated":
+        summary_parts.append(f"  Spend: {sheet_data.get('spend', 0):,.0f} | Orders: {sheet_data.get('orders', 0):.0f} | CPO: {cpo if cpo else '?'}")
+        if cpa:
+            summary_parts.append(f"  CPA: {cpa}")
+    else:
+        summary_parts.append("  الشيت لسه مش متحدث")
+
+    if not tracking["complete"]:
+        missing_labels = [m["label"] for m in tracking["missing"]]
+        summary_parts.append(f"  ناقص: {', '.join(missing_labels)}")
+    else:
+        summary_parts.append("  ✅ بعت كل المطلوب")
+
+    if recommendation:
+        summary_parts.append(f"  {recommendation}")
+
+    return {
+        "team_name": team_name,
+        "leader": leader,
+        "received": tracking["received"],
+        "received_types": tracking["received_types"],
+        "missing": tracking["missing"],
+        "complete": tracking["complete"],
+        "sheet_status": sheet_status,
+        "sheet_data": sheet_data,
+        "cpo_status": cpo_status,
+        "recommendation": recommendation,
+        "summary": "\n".join(summary_parts),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PROACTIVE MONITORING
 # ══════════════════════════════════════════════════════════════════════
 
 async def proactive_sheet_check() -> list[dict]:
-    """
-    Check ALL team sheets proactively. Returns list of alerts.
-    Called by scheduled job - bot initiates, doesn't wait for screenshots.
-    """
+    """Check ALL team sheets proactively. Returns list of alerts."""
     alerts = []
-    now = _now_egypt()
-    today_str = now.strftime("%-m/%-d/%Y")  # Match sheet date format
 
     for team_name, info in TEAM_INFO.items():
         try:
@@ -1890,7 +1964,6 @@ async def proactive_sheet_check() -> list[dict]:
             today_row = get_team_sheet_today(rows)
             recent = get_team_sheet_recent(rows, 5)
 
-            # Check if today's data exists
             if not today_row:
                 alerts.append({
                     "team": team_name, "leader": info["leader"],
@@ -1899,7 +1972,6 @@ async def proactive_sheet_check() -> list[dict]:
                 })
                 continue
 
-            # Check for anomalies in recent data
             spend = _safe_num(today_row.get("Spend", ""))
             orders = _safe_num(today_row.get("New Orders", ""))
             cpo = _safe_num(today_row.get("CPO", ""))
@@ -1915,7 +1987,7 @@ async def proactive_sheet_check() -> list[dict]:
                         "msg": f"⚠️ {team_name} صرف صفر النهاردة! أمس كان {prev_spend:,.0f}"
                     })
 
-            # CPO spike (> 200)
+            # CPO spike
             if cpo and cpo > 200:
                 alerts.append({
                     "team": team_name, "leader": info["leader"],
@@ -1923,7 +1995,7 @@ async def proactive_sheet_check() -> list[dict]:
                     "msg": f"🔴 {team_name} CPO = {cpo:.0f} (عالي جداً)"
                 })
 
-            # CPA spike (> 200)
+            # CPA spike
             if cpa and cpa > 200:
                 alerts.append({
                     "team": team_name, "leader": info["leader"],
@@ -1948,15 +2020,15 @@ async def proactive_sheet_check() -> list[dict]:
     return alerts
 
 
+# ══════════════════════════════════════════════════════════════════════
+# SMART DAILY REPORT (for owner)
+# ══════════════════════════════════════════════════════════════════════
+
 async def generate_smart_daily_report() -> str:
-    """
-    Generate a comprehensive daily report with AI analysis.
-    Compares all teams, identifies best/worst, gives strategic recommendations.
-    """
+    """Generate a comprehensive daily report with AI analysis."""
     if not CLAUDE_API_KEY:
         return ""
 
-    # Gather all team data
     all_teams_data = []
     for team_name, info in TEAM_INFO.items():
         rows = await fetch_team_sheet(team_name)
@@ -1981,7 +2053,6 @@ async def generate_smart_daily_report() -> str:
     if not all_teams_data:
         return "مفيش بيانات كافية للتقرير"
 
-    # Build data summary for AI
     data_text = "## بيانات كل الفرق النهاردة:\n"
     total_spend = 0
     total_orders = 0
@@ -2015,6 +2086,8 @@ async def generate_smart_daily_report() -> str:
 
 الحملات كلها Facebook Messages Ads. الجمهور مقيمين في الكويت.
 CPO/CPA: أخضر ≤ 150 | أصفر ≤ 180 | أحمر > 180
+
+ابدأ بـ "أنا شايف إن..." واختم بـ "صح كده؟"
 بالعربي المصري. مختصر وعملي."""
 
     try:
@@ -2029,102 +2102,3 @@ CPO/CPA: أخضر ≤ 150 | أصفر ≤ 180 | أحمر > 180
     except Exception as e:
         logger.error("Smart report error: %s", e)
         return ""
-
-
-# ══════════════════════════════════════════════════════════════════════
-# CREATIVE TRACKING - remember creatives and link to performance
-# ══════════════════════════════════════════════════════════════════════
-
-CREATIVE_HISTORY_FILE = DATA_DIR / "creative_history.json"
-
-
-def load_creative_history() -> list[dict]:
-    if CREATIVE_HISTORY_FILE.exists():
-        try:
-            return json.loads(CREATIVE_HISTORY_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-    return []
-
-
-def save_creative_record(team_name: str, creative_type: str, analysis_summary: str):
-    """Save a record when a creative is analyzed, so we can link it to performance later."""
-    history = load_creative_history()
-    history.append({
-        "date": _now_egypt().strftime("%Y-%m-%d"),
-        "team": team_name,
-        "type": creative_type,  # "video" or "image"
-        "summary": analysis_summary[:300],
-    })
-    # Keep last 50
-    history = history[-50:]
-    CREATIVE_HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def get_last_creative(team_name: str) -> dict | None:
-    """Get the last creative analyzed for a team."""
-    history = load_creative_history()
-    for record in reversed(history):
-        if record["team"] == team_name:
-            return record
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════
-# BUDGET TRACKING - fawry codes + card payments
-# ══════════════════════════════════════════════════════════════════════
-
-BUDGET_FILE = DATA_DIR / "budget_tracking.json"
-
-
-def load_budget_data() -> list[dict]:
-    if BUDGET_FILE.exists():
-        try:
-            return json.loads(BUDGET_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-    return []
-
-
-def save_budget_entry(team_name: str, amount: float, payment_type: str, platform: str, source: str = ""):
-    """
-    Track a budget entry: fawry code, card payment, or prepaid top-up.
-    payment_type: 'fawry' | 'card' | 'prepaid' | 'manual'
-    platform: 'facebook' | 'tiktok'
-    source: 'owner_image' | 'team_payment_screenshot'
-    """
-    data = load_budget_data()
-    data.append({
-        "date": _now_egypt().strftime("%Y-%m-%d"),
-        "team": team_name,
-        "amount": amount,
-        "type": payment_type,
-        "platform": platform,
-        "source": source,
-    })
-    BUDGET_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("Budget entry: %s +%s (%s/%s)", team_name, amount, payment_type, platform)
-
-
-def get_team_budget_today(team_name: str) -> dict:
-    """Get today's budget summary for a team."""
-    data = load_budget_data()
-    today = _now_egypt().strftime("%Y-%m-%d")
-    today_entries = [d for d in data if d["team"] == team_name and d["date"] == today]
-
-    total = sum(d["amount"] for d in today_entries)
-    by_type = {}
-    for d in today_entries:
-        by_type[d["type"]] = by_type.get(d["type"], 0) + d["amount"]
-
-    return {"total": total, "by_type": by_type, "entries": today_entries}
-
-
-def get_team_budget_month(team_name: str) -> dict:
-    """Get this month's budget summary for a team."""
-    data = load_budget_data()
-    month = _now_egypt().strftime("%Y-%m")
-    month_entries = [d for d in data if d["team"] == team_name and d["date"].startswith(month)]
-
-    total = sum(d["amount"] for d in month_entries)
-    return {"total": total, "count": len(month_entries)}
