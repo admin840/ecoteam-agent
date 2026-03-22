@@ -160,6 +160,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await photo_file.download_to_memory(photo_bytes_io)
     photo_bytes = photo_bytes_io.getvalue()
 
+    # Quick check: is this work or personal?
+    leader = analyzer.get_leader(team_name)
+    try:
+        quick_check = await analyzer.quick_image_check(photo_bytes)
+        if quick_check == "PERSONAL":
+            await msg.reply_text(f"😄 يا {leader}، ده مش تقرير! لو محتاج حاجة أنا موجود 🙏")
+            return
+    except Exception as e:
+        logger.warning("Quick image check failed, proceeding with buttons: %s", e)
+
     # Store pending photo in chat_data keyed by message id
     msg_id = msg.message_id
     if "pending_photos" not in context.chat_data:

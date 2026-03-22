@@ -1328,6 +1328,38 @@ def rank_teams(all_data: list[dict]) -> dict:
 # TEAM CONTEXT BUILDER
 # ══════════════════════════════════════════════════════════════════════
 
+def _calc_db_history_stats(db_rows: list[dict]) -> dict:
+    """Calculate aggregate stats from DB historical performance rows."""
+    if not db_rows:
+        return {}
+    cpos = [r["cpo"] for r in db_rows if r.get("cpo") and r["cpo"] > 0]
+    cpas = [r["cpa"] for r in db_rows if r.get("cpa") and r["cpa"] > 0]
+    stats = {}
+    if cpos:
+        stats["avg_cpo"] = round(sum(cpos) / len(cpos))
+        best_row = min(db_rows, key=lambda r: r.get("cpo") or 99999)
+        worst_row = max(db_rows, key=lambda r: r.get("cpo") or 0)
+        stats["best_day"] = {"date": best_row.get("date", "?"), "cpo": best_row.get("cpo")}
+        stats["worst_day"] = {"date": worst_row.get("date", "?"), "cpo": worst_row.get("cpo")}
+        # Trend: compare last 7 days avg vs previous 7 days avg
+        if len(cpos) >= 10:
+            recent = cpos[-7:]
+            earlier = cpos[-14:-7] if len(cpos) >= 14 else cpos[:len(cpos)-7]
+            if earlier:
+                recent_avg = sum(recent) / len(recent)
+                earlier_avg = sum(earlier) / len(earlier)
+                if recent_avg < earlier_avg * 0.9:
+                    stats["trend"] = "improving"
+                elif recent_avg > earlier_avg * 1.1:
+                    stats["trend"] = "declining"
+                else:
+                    stats["trend"] = "stable"
+    if cpas:
+        stats["avg_cpa"] = round(sum(cpas) / len(cpas))
+    stats["days_count"] = len(db_rows)
+    return stats
+
+
 async def build_team_context(team_name: str, all_data: list[dict] | None = None) -> dict:
     """Build rich context for any team analysis."""
     if all_data is None:
@@ -1335,7 +1367,14 @@ async def build_team_context(team_name: str, all_data: list[dict] | None = None)
 
     leader = get_leader(team_name)
 
-    # PRIMARY: team's own sheet
+    # DB HISTORICAL DATA (PRIMARY - fast, 30 days)
+    db_history = db_get_daily_performance(team_name, days=30)
+    db_stats = _calc_db_history_stats(db_history)
+
+    # DB LEARNINGS
+    db_learnings = db_get_learnings(team_name, limit=10)
+
+    # Team's own sheet
     team_sheet_rows = await fetch_team_sheet(team_name)
     team_sheet_today = get_team_sheet_today(team_sheet_rows) if team_sheet_rows else None
 
@@ -1346,9 +1385,11 @@ async def build_team_context(team_name: str, all_data: list[dict] | None = None)
     rankings = rank_teams(all_data)
     conversation = get_recent_context(team_name)
 
-    # Trend calculation
+    # Trend calculation (prefer DB data if available)
     trend = "unknown"
-    if len(history) >= 3:
+    if db_stats.get("trend"):
+        trend = db_stats["trend"]
+    elif len(history) >= 3:
         cpos = [c for c in (_safe_num(r.get("CPO اليوم")) for r in history[-3:]) if c is not None]
         if len(cpos) >= 2:
             if cpos[-1] < cpos[0]:
@@ -1389,6 +1430,9 @@ async def build_team_context(team_name: str, all_data: list[dict] | None = None)
         "worst_team": rankings.get("worst"),
         "mtd": mtd_row,
         "conversation": conversation,
+        "db_history": db_history,
+        "db_stats": db_stats,
+        "db_learnings": db_learnings,
     }
 
 
@@ -1447,6 +1491,31 @@ def format_context_for_prompt(ctx: dict) -> str:
         parts.append(f"\n## ⚠️ تنبيهات:")
         for a in ctx["anomalies"]:
             parts.append(f"  {a}")
+
+    # DB historical stats (30 days)
+    db_stats = ctx.get("db_stats", {})
+    if db_stats:
+        parts.append(f"\n## 📊 تاريخ الأداء (آخر {db_stats.get('days_count', 30)} يوم):")
+        if db_stats.get("avg_cpo"):
+            parts.append(f"  - متوسط CPO: {db_stats['avg_cpo']}")
+        if db_stats.get("avg_cpa"):
+            parts.append(f"  - متوسط CPA: {db_stats['avg_cpa']}")
+        best = db_stats.get("best_day")
+        if best:
+            parts.append(f"  - أحسن يوم: {best['date']} (CPO {best['cpo']})")
+        worst = db_stats.get("worst_day")
+        if worst:
+            parts.append(f"  - أسوأ يوم: {worst['date']} (CPO {worst['cpo']})")
+        trend_map = {"improving": "تحسن 📈", "declining": "تراجع 📉", "stable": "مستقر ➡️"}
+        if db_stats.get("trend"):
+            parts.append(f"  - الاتجاه: {trend_map.get(db_stats['trend'], db_stats['trend'])}")
+
+    # DB learnings (past corrections)
+    db_learnings = ctx.get("db_learnings", [])
+    if db_learnings:
+        parts.append(f"\n## 📝 تصحيحات سابقة (تعلّمت منها):")
+        for l in db_learnings[-5:]:
+            parts.append(f"  - {l.get('date', '')}: {l.get('correction', '')}")
 
     # Conversation memory
     if ctx.get("conversation"):
@@ -1717,6 +1786,43 @@ async def analyze_screenshot(image_bytes: bytes, team_name: str, report_type: st
 
 
 # ══════════════════════════════════════════════════════════════════════
+# QUICK IMAGE CHECK - filter personal images before buttons
+# ══════════════════════════════════════════════════════════════════════
+
+async def quick_image_check(image_bytes: bytes) -> str:
+    """Quick check if image is work-related or personal. Returns 'WORK' or 'PERSONAL'."""
+    if not CLAUDE_API_KEY:
+        return "WORK"  # default to work if no API key
+    try:
+        client = anthropic.AsyncAnthropic(api_key=CLAUDE_API_KEY)
+        img_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        resp = await client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=10,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64},
+                    },
+                    {
+                        "type": "text",
+                        "text": "Is this a work-related image (ads dashboard, payment, spreadsheet, creative, product photo, analytics) or a personal/casual image (selfie, food, child, meme, personal photo)? Reply with just: WORK or PERSONAL",
+                    },
+                ],
+            }],
+        )
+        result = resp.content[0].text.strip().upper()
+        if "PERSONAL" in result:
+            return "PERSONAL"
+        return "WORK"
+    except Exception as e:
+        logger.error("Quick image check error: %s", e)
+        return "WORK"  # default to work on error
+
+
+# ══════════════════════════════════════════════════════════════════════
 # SMART ANALYSIS - the core intelligence engine
 # ══════════════════════════════════════════════════════════════════════
 
@@ -1782,8 +1888,35 @@ async def smart_analysis(
         is_mtd = True
         logger.info("Screenshot looks like MTD totals (ss=%s vs daily=%s)", ss_spend, ts_spend)
 
-    # Get learnings
+    # Get learnings (from DB + JSON fallback)
     learnings_text = get_learnings_for_prompt(team_name)
+    # Also get DB learnings directly for richer context
+    db_learnings = ctx.get("db_learnings", [])
+    if db_learnings and not learnings_text:
+        lines = ["## 📝 تصحيحات سابقة (تعلّمت منها):"]
+        for l in db_learnings[-5:]:
+            lines.append(f"- {l.get('date', '')}: {l.get('correction', '')}")
+        learnings_text = "\n".join(lines)
+
+    # DB history stats for prompts
+    db_stats = ctx.get("db_stats", {})
+    db_history_text = ""
+    if db_stats:
+        db_parts = [f"## 📊 تاريخ الأداء (آخر {db_stats.get('days_count', 30)} يوم):"]
+        if db_stats.get("avg_cpo"):
+            db_parts.append(f"  - متوسط CPO: {db_stats['avg_cpo']}")
+        if db_stats.get("avg_cpa"):
+            db_parts.append(f"  - متوسط CPA: {db_stats['avg_cpa']}")
+        best = db_stats.get("best_day")
+        if best:
+            db_parts.append(f"  - أحسن يوم: {best['date']} (CPO {best['cpo']})")
+        worst = db_stats.get("worst_day")
+        if worst:
+            db_parts.append(f"  - أسوأ يوم: {worst['date']} (CPO {worst['cpo']})")
+        trend_map = {"improving": "تحسن 📈", "declining": "تراجع 📉", "stable": "مستقر ➡️"}
+        if db_stats.get("trend"):
+            db_parts.append(f"  - الاتجاه: {trend_map.get(db_stats['trend'], db_stats['trend'])}")
+        db_history_text = "\n".join(db_parts)
 
     # Creative history
     creative_text = ""
@@ -1828,6 +1961,8 @@ async def smart_analysis(
 
 {ss_text}
 {ts_text}
+{db_history_text}
+{learnings_text}
 
 ## 🔴 فرق في الأرقام:
 {verification['summary']}
@@ -1838,6 +1973,7 @@ async def smart_analysis(
 - اسأله: "أنهي الرقم الصح؟ الشيت ولا الـ screenshot؟"
 - ابدأ بـ "أنا شايف إن..."
 - اختم بـ "صح كده؟"
+- لو في تصحيحات سابقة مشابهة، اتعلم منها ومتكررش نفس الغلط
 
 خاطب {leader} بالاسم. مختصر (3-5 سطور). بالعربي المصري."""
 
@@ -1846,6 +1982,8 @@ async def smart_analysis(
 
 {ss_text}
 {ts_text}
+{db_history_text}
+{learnings_text}
 
 ## ملاحظة: الأرقام في الـ screenshot دي تراكمية (MTD) مش أرقام يوم واحد.
 
@@ -1854,6 +1992,7 @@ async def smart_analysis(
 - احسب الـ CPO التراكمي وقيّمه
 - قارن مع أرقام آخر يوم في الشيت
 - ابدأ بـ "أنا شايف إن..." واختم بـ "صح كده؟"
+- لو في تصحيحات سابقة مشابهة، اتعلم منها
 
 خاطب {leader} بالاسم. مختصر (3-4 سطور). بالعربي المصري."""
 
@@ -1862,11 +2001,14 @@ async def smart_analysis(
 
 {ss_text}
 {ts_text}
+{db_history_text}
+{learnings_text}
 
 ## المطلوب:
 الشيت لسه مش متحدث. حلل الأرقام اللي في الـ screenshot بس:
 - لو فيها spend و orders: احسب الـ CPO وقيّمه
 - ابدأ بـ "أنا شايف إن..." واختم بـ "صح كده؟"
+- لو في تاريخ أداء أو تصحيحات سابقة، استخدمهم في التحليل
 
 خاطب {leader} بالاسم. مختصر (2-3 سطور). بالعربي المصري."""
 
@@ -1876,6 +2018,7 @@ async def smart_analysis(
 {ss_text}
 {ts_text}
 {context_text}
+{db_history_text}
 {learnings_text}
 {creative_text}
 {budget_text}
