@@ -60,25 +60,36 @@ def main():
         reader = csv.reader(io.StringIO(csv_text))
         rows = list(reader)
 
-        # Find header row (contains "date" anywhere in first cell)
+        # Find first data row (starts with a date like 2/26/2026 or 3/1/2026)
         header_idx = -1
         for i, row in enumerate(rows):
-            if row and "date" in str(row[0]).strip().lower():
-                header_idx = i
-                break
+            if row and row[0]:
+                cell = str(row[0]).strip()
+                # Check if it looks like a date (contains / and digits)
+                if "/" in cell and any(ch.isdigit() for ch in cell) and len(cell) < 15:
+                    header_idx = i - 1  # data starts here
+                    break
 
-        if header_idx == -1:
-            # Try row 0 as header if data starts at row 1
-            if len(rows) > 1 and rows[1] and any(ch.isdigit() for ch in str(rows[1][0])):
-                header_idx = 0
-            else:
-                print(f"  No header found for {team}")
-                continue
+        if header_idx < 0:
+            header_idx = 0
+
+        # Find actual first data row
+        data_start = header_idx
+        for i in range(header_idx, len(rows)):
+            if rows[i] and rows[i][0]:
+                cell = str(rows[i][0]).strip()
+                if "/" in cell and any(ch.isdigit() for ch in cell):
+                    data_start = i
+                    break
+
+        if data_start >= len(rows):
+            print(f"  No data found for {team}")
+            continue
 
         team_rows = 0
         prev_spend = 0
 
-        for row in rows[header_idx + 1:]:
+        for row in rows[data_start:]:
             if not row or not row[0] or not row[0].strip():
                 continue
 
