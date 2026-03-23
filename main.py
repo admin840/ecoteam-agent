@@ -1414,13 +1414,52 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Step 1: Send "loading" message immediately (don't edit the button message)
-    loading_msgs = {
-        "analyze": f"📊 تمام يا {leader}! ابعتيلي screenshot أو اكتبيلي الأرقام وأنا هحللهم فوراً.",
-        "creative": f"🎨 تمام يا {leader}! ابعتيلي صورة أو فيديو الإعلان وأنا هقيّمه.",
-        "adcopy": f"✍️ تمام يا {leader}! قوليلي اسم المنتج ووصفه وأنا هكتبلك نسخ إعلانية.",
-        "sheet": f"📋 تمام يا {leader}! ابعتيلي الملف (CSV أو Excel أو PDF) وأنا هحلله.",
-        "question": f"😊 تمام يا {leader}! اسألي أي سؤال عن الإعلانات أو الأداء.",
+    # Step 1: For each action, show SMART OPTIONS with inline buttons
+    action_keyboards = {
+        "analyze": {
+            "text": f"📊 تمام يا {leader}! إيه اللي تحبي أحلله؟",
+            "buttons": [
+                [InlineKeyboardButton("📋 أقرأ الشيت بتاعك", callback_data="ha_read_sheet"),
+                 InlineKeyboardButton("📸 هبعت screenshot", callback_data="ha_wait_photo")],
+                [InlineKeyboardButton("✏️ هكتب الأرقام", callback_data="ha_wait_text"),
+                 InlineKeyboardButton("❓ حاجة تانية", callback_data="ha_other")],
+            ],
+        },
+        "creative": {
+            "text": f"🎨 تمام يا {leader}! إيه اللي عايزة أحلله؟",
+            "buttons": [
+                [InlineKeyboardButton("📸 هبعت صورة الإعلان", callback_data="hc_wait_photo"),
+                 InlineKeyboardButton("🎬 هبعت فيديو", callback_data="hc_wait_video")],
+                [InlineKeyboardButton("🔗 هبعت لينك", callback_data="hc_wait_link"),
+                 InlineKeyboardButton("❓ حاجة تانية", callback_data="hc_other")],
+            ],
+        },
+        "adcopy": {
+            "text": f"✍️ تمام يا {leader}! محتاج منك شوية تفاصيل:",
+            "buttons": [
+                [InlineKeyboardButton("📝 هكتب التفاصيل", callback_data="had_write"),
+                 InlineKeyboardButton("📸 هبعت صورة المنتج", callback_data="had_photo")],
+                [InlineKeyboardButton("❓ مش متأكد/ة", callback_data="had_help")],
+            ],
+        },
+        "sheet": {
+            "text": f"📋 تمام يا {leader}! إيه الملف؟",
+            "buttons": [
+                [InlineKeyboardButton("📄 ملف CSV/Excel", callback_data="hs_file"),
+                 InlineKeyboardButton("📑 ملف PDF", callback_data="hs_pdf")],
+                [InlineKeyboardButton("📋 أقرأ الشيت بتاعك", callback_data="hs_read_sheet"),
+                 InlineKeyboardButton("❓ حاجة تانية", callback_data="hs_other")],
+            ],
+        },
+        "question": {
+            "text": f"😊 تمام يا {leader}! اسألي عن أي حاجة:",
+            "buttons": [
+                [InlineKeyboardButton("📊 أداء فريقي", callback_data="hq_perf"),
+                 InlineKeyboardButton("💰 البادجت", callback_data="hq_budget")],
+                [InlineKeyboardButton("🎯 استراتيجية", callback_data="hq_strategy"),
+                 InlineKeyboardButton("✏️ سؤال تاني", callback_data="hq_free")],
+            ],
+        },
     }
 
     # Step 2: For "weekly" and "suggest" - READ SHEET + DB then analyze
@@ -1504,11 +1543,17 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["waiting_adcopy"] = True
 
     else:
-        # For analyze, creative, sheet, question - send prompt and set waiting state
-        msg = loading_msgs.get(action, f"يا {leader}، قوليلي محتاجة إيه وأنا هساعدك!")
-        await context.bot.send_message(chat_id, msg)
+        # Show smart options with inline buttons
+        ak = action_keyboards.get(action)
+        if ak:
+            await context.bot.send_message(
+                chat_id, ak["text"],
+                reply_markup=InlineKeyboardMarkup(ak["buttons"]),
+            )
+        else:
+            await context.bot.send_message(chat_id, f"يا {leader}، قوليلي محتاجة إيه وأنا هساعدك!")
         _record_bot_message(chat_id)
-        # Set waiting state so next photo/text is treated as response to this request
+        # Set waiting state
         context.chat_data["help_waiting"] = {
             "action": action,
             "team": team_name,
@@ -2395,6 +2440,119 @@ async def callback_creative_reaction(update: Update, context: ContextTypes.DEFAU
 # CALLBACK QUERY ROUTER
 # ══════════════════════════════════════════════════════════════════════
 
+async def callback_help_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle sub-buttons from help menu (ha_, hc_, had_, hs_, hq_)."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    team_name = get_team_name(chat_id)
+    if not team_name:
+        return
+    leader = analyzer.get_leader(team_name)
+    data = query.data
+
+    # Remove the sub-buttons
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # ── Analyze sub-buttons ──
+    if data == "ha_read_sheet":
+        await context.bot.send_message(chat_id, f"📊 خليني أقرأ الشيت يا {leader}... ⏳")
+        _record_bot_message(chat_id)
+        context.chat_data.pop("help_waiting", None)
+        rows = await analyzer.fetch_team_sheet(team_name)
+        recent = analyzer.get_team_sheet_recent(rows, 7) if rows else []
+        d = f"بيانات {team_name} آخر 7 أيام:\n"
+        for r in recent:
+            d += f"- {r.get('Date','')}: Spend={r.get('Spend','0')} | Orders={r.get('New Orders','0')} | Del={r.get('Delivered','0')} | Cancel={r.get('Cancel','0')}\n"
+        analysis = await analyzer.analyze_text_message(team_name, f"حلل الأرقام دي بالتفصيل واقتراحاتك:\n{d}", "")
+        if analysis:
+            await send_long_message(context, chat_id, analysis)
+        else:
+            await context.bot.send_message(chat_id, f"يا {leader}، مش قادر أحلل. جرّبي تاني.")
+
+    elif data in ("ha_wait_photo", "hc_wait_photo", "had_photo"):
+        await context.bot.send_message(chat_id, f"تمام يا {leader}! ابعتي الصورة 📸")
+        _record_bot_message(chat_id)
+
+    elif data in ("ha_wait_text", "had_write"):
+        if "had" in data:
+            await context.bot.send_message(chat_id, f"تمام يا {leader}! اكتبيلي:\n1️⃣ اسم المنتج\n2️⃣ وصف بسيط\n3️⃣ السعر\n4️⃣ العرض/الخصم")
+        else:
+            await context.bot.send_message(chat_id, f"تمام يا {leader}! اكتبي الأرقام (مثلاً: صرف 3000 طلبات 25)")
+        _record_bot_message(chat_id)
+
+    elif data == "hc_wait_video":
+        await context.bot.send_message(chat_id, f"تمام يا {leader}! ابعتي الفيديو 🎬")
+        _record_bot_message(chat_id)
+
+    elif data == "hc_wait_link":
+        await context.bot.send_message(chat_id, f"تمام يا {leader}! ابعتي اللينك 🔗")
+        _record_bot_message(chat_id)
+
+    elif data == "hs_read_sheet":
+        await context.bot.send_message(chat_id, f"📋 خليني أقرأ الشيت يا {leader}... ⏳")
+        _record_bot_message(chat_id)
+        context.chat_data.pop("help_waiting", None)
+        rows = await analyzer.fetch_team_sheet(team_name)
+        recent = analyzer.get_team_sheet_recent(rows, 7) if rows else []
+        d = f"بيانات {team_name}:\n"
+        for r in recent:
+            d += f"- {r.get('Date','')}: Spend={r.get('Spend','0')} | Orders={r.get('New Orders','0')}\n"
+        analysis = await analyzer.analyze_text_message(team_name, f"راجع البيانات دي وقولي ملاحظاتك:\n{d}", "")
+        if analysis:
+            await send_long_message(context, chat_id, analysis)
+
+    elif data in ("hs_file", "hs_pdf"):
+        await context.bot.send_message(chat_id, f"تمام يا {leader}! ابعتي الملف 📄")
+        _record_bot_message(chat_id)
+
+    # ── Question sub-buttons ──
+    elif data == "hq_perf":
+        context.chat_data.pop("help_waiting", None)
+        await context.bot.send_message(chat_id, f"📊 خليني أشوف أداء {team_name}... ⏳")
+        _record_bot_message(chat_id)
+        rows = await analyzer.fetch_team_sheet(team_name)
+        recent = analyzer.get_team_sheet_recent(rows, 7) if rows else []
+        d = f"بيانات {team_name}:\n"
+        for r in recent:
+            d += f"- {r.get('Date','')}: Spend={r.get('Spend','0')} | Orders={r.get('New Orders','0')} | CPO={r.get('CPO','0')}\n"
+        analysis = await analyzer.analyze_text_message(team_name, f"حلل أداء الفريق:\n{d}", "")
+        if analysis:
+            await send_long_message(context, chat_id, analysis)
+
+    elif data == "hq_budget":
+        context.chat_data.pop("help_waiting", None)
+        await context.bot.send_message(chat_id, f"💰 خليني أشوف البادجت... ⏳")
+        _record_bot_message(chat_id)
+        rows = await analyzer.fetch_team_sheet(team_name)
+        recent = analyzer.get_team_sheet_recent(rows, 7) if rows else []
+        total = sum(analyzer._safe_num(r.get("Spend", "")) for r in recent)
+        analysis = await analyzer.analyze_text_message(team_name, f"إجمالي الصرف آخر 7 أيام: {total:,.0f} جنيه. حلل وقولي اقتراحاتك للبادجت.", "")
+        if analysis:
+            await send_long_message(context, chat_id, analysis)
+
+    elif data == "hq_strategy":
+        context.chat_data.pop("help_waiting", None)
+        await context.bot.send_message(chat_id, f"🎯 خليني أفكر في استراتيجية لـ {team_name}... ⏳")
+        _record_bot_message(chat_id)
+        analysis = await analyzer.analyze_text_message(team_name, f"اقترح استراتيجية لتحسين أداء فريق {team_name} بناءً على البيانات المتاحة.", "")
+        if analysis:
+            await send_long_message(context, chat_id, analysis)
+
+    elif data == "hq_free":
+        await context.bot.send_message(chat_id, f"تمام يا {leader}! اكتبي سؤالك ✏️")
+        _record_bot_message(chat_id)
+        context.chat_data["help_waiting"] = {"action": "question", "team": team_name, "time": analyzer._now_egypt().isoformat()}
+
+    elif data in ("ha_other", "hc_other", "had_help", "hs_other"):
+        await context.bot.send_message(chat_id, f"تمام يا {leader}! قوليلي محتاجة إيه بالظبط ✏️")
+        _record_bot_message(chat_id)
+        context.chat_data["help_waiting"] = {"action": "question", "team": team_name, "time": analyzer._now_egypt().isoformat()}
+
+
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route all callback queries based on prefix."""
     query = update.callback_query
@@ -2421,6 +2579,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await callback_creative_reaction(update, context)
     elif data.startswith("help_"):
         await callback_help(update, context)
+    elif data.startswith(("ha_", "hc_", "had_", "hs_", "hq_")):
+        await callback_help_sub(update, context)
     else:
         logger.warning("Unknown callback data: %s", data)
         await query.answer("⚠️")
