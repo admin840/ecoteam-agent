@@ -1331,31 +1331,70 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "question": f"😊 تمام يا {leader}! اسألي أي سؤال عن الإعلانات أو الأداء.",
     }
 
-    # Step 2: For "weekly" and "suggest" - actually work NOW
+    # Step 2: For "weekly" and "suggest" - READ SHEET + DB then analyze
     if action == "weekly":
-        await query.message.reply_text(f"📈 خليني أشوف أداء {team_name} الأسبوع ده... ⏳")
+        await query.message.reply_text(f"📈 خليني أقرأ شيت {team_name} وأحلل الأداء... ⏳")
         _record_bot_message(chat_id)
         try:
+            # Read DIRECTLY from team's Google Sheet (primary source)
+            sheet_rows = await analyzer.fetch_team_sheet(team_name)
+            recent = analyzer.get_team_sheet_recent(sheet_rows, 7) if sheet_rows else []
+            today = analyzer.get_team_sheet_today(sheet_rows) if sheet_rows else None
+
+            # Build data summary for Claude
+            data_text = f"بيانات فريق {team_name} من الشيت مباشرة:\n\n"
+            if recent:
+                for r in recent:
+                    date = r.get("Date", "?")
+                    spend = r.get("Spend", "0")
+                    orders = r.get("New Orders", "0")
+                    delivered = r.get("Delivered", "0")
+                    cancel = r.get("Cancel", "0")
+                    data_text += f"- {date}: Spend={spend} | Orders={orders} | Del={delivered} | Cancel={cancel}\n"
+            else:
+                data_text += "مفيش بيانات في الشيت\n"
+
+            # Also get DB history
+            db_perf = analyzer.db_get_daily_performance(team_name, days=7)
+            if db_perf:
+                data_text += f"\nبيانات إضافية من الـ DB ({len(db_perf)} يوم)\n"
+
             analysis = await analyzer.analyze_text_message(
                 team_name,
-                f"حلل أداء فريق {team_name} الأسبوع ده بالتفصيل. قولي الأرقام والـ trends واقتراحاتك. استخدم البيانات التاريخية من الـ DB.",
+                f"حلل أداء فريق {team_name} الأسبوع ده بالتفصيل.\n\n{data_text}\n\nقولي الأرقام والـ trends واقتراحاتك. قارن بين الأيام وقولي أحسن وأسوأ يوم ولية.",
                 ""
             )
             if analysis:
                 await send_long_message(context, chat_id, analysis)
             else:
-                await context.bot.send_message(chat_id, f"يا {leader}، مش لاقي بيانات كافية للأسبوع ده. ابعتيلي الأرقام وأنا هحلل.")
+                await context.bot.send_message(chat_id, f"يا {leader}، مش قادر أحلل دلوقتي. جرّبي تاني.")
         except Exception as e:
             logger.error("Weekly analysis error: %s", e)
-            await context.bot.send_message(chat_id, f"يا {leader}، حصل مشكلة في التحليل. جرّبي تاني بعد شوية.")
+            await context.bot.send_message(chat_id, f"يا {leader}، حصل مشكلة: {str(e)[:100]}")
 
     elif action == "suggest":
-        await query.message.reply_text(f"💡 خليني أفكر في اقتراحات لـ {team_name}... ⏳")
+        await query.message.reply_text(f"💡 خليني أقرأ بيانات {team_name} وأفكر في اقتراحات... ⏳")
         _record_bot_message(chat_id)
         try:
+            # Read from sheet
+            sheet_rows = await analyzer.fetch_team_sheet(team_name)
+            recent = analyzer.get_team_sheet_recent(sheet_rows, 14) if sheet_rows else []
+
+            data_text = f"بيانات فريق {team_name} آخر 14 يوم:\n"
+            if recent:
+                total_spend = sum(analyzer._safe_num(r.get("Spend", "")) for r in recent)
+                total_orders = sum(analyzer._safe_num(r.get("New Orders", "")) for r in recent)
+                total_del = sum(analyzer._safe_num(r.get("Delivered", "")) for r in recent)
+                total_cancel = sum(analyzer._safe_num(r.get("Cancel", "")) for r in recent)
+                avg_cpo = total_spend / total_orders if total_orders > 0 else 0
+                data_text += f"إجمالي: Spend={total_spend:,.0f} | Orders={total_orders:.0f} | Del={total_del:.0f} | Cancel={total_cancel:.0f}\n"
+                data_text += f"متوسط CPO={avg_cpo:.0f}\n"
+                for r in recent[-5:]:
+                    data_text += f"- {r.get('Date','?')}: Spend={r.get('Spend','0')} | Orders={r.get('New Orders','0')}\n"
+
             analysis = await analyzer.analyze_text_message(
                 team_name,
-                f"بناءً على كل البيانات عندك عن فريق {team_name}، إيه اقتراحاتك لتحسين الأداء؟ CPO, CPA, cancel rate, budget allocation. كن محدد وعملي.",
+                f"بناءً على البيانات دي عن فريق {team_name}:\n{data_text}\n\nإيه اقتراحاتك لتحسين الأداء؟ كن محدد وعملي.",
                 ""
             )
             if analysis:
