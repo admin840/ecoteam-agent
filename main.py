@@ -1316,11 +1316,17 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     team_name = get_team_name(chat_id)
     if not team_name:
-        await query.message.reply_text("⚠️ الجروب ده مش مسجل عندي.")
+        await context.bot.send_message(chat_id, "⚠️ الجروب ده مش مسجل عندي.")
         return
     leader = analyzer.get_leader(team_name)
     action = query.data.replace("help_", "")
     logger.info("Help button: %s from %s (%s)", action, leader, team_name)
+
+    # Remove the help menu buttons so they can't be clicked again
+    try:
+        await query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     # Step 1: Send "loading" message immediately (don't edit the button message)
     loading_msgs = {
@@ -1333,7 +1339,7 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Step 2: For "weekly" and "suggest" - READ SHEET + DB then analyze
     if action == "weekly":
-        await query.message.reply_text(f"📈 خليني أقرأ شيت {team_name} وأحلل الأداء... ⏳")
+        await context.bot.send_message(chat_id, f"📈 خليني أقرأ شيت {team_name} وأحلل الأداء... ⏳")
         _record_bot_message(chat_id)
         try:
             # Read DIRECTLY from team's Google Sheet (primary source)
@@ -1373,7 +1379,7 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id, f"يا {leader}، حصل مشكلة: {str(e)[:100]}")
 
     elif action == "suggest":
-        await query.message.reply_text(f"💡 خليني أقرأ بيانات {team_name} وأفكر في اقتراحات... ⏳")
+        await context.bot.send_message(chat_id, f"💡 خليني أقرأ بيانات {team_name} وأفكر في اقتراحات... ⏳")
         _record_bot_message(chat_id)
         try:
             # Read from sheet
@@ -1406,7 +1412,7 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id, f"يا {leader}، حصل مشكلة. جرّبي تاني.")
 
     elif action == "adcopy":
-        await query.message.reply_text(f"✍️ تمام يا {leader}! اكتبيلي:\n\n1️⃣ اسم المنتج\n2️⃣ وصف بسيط\n3️⃣ السعر\n4️⃣ العرض أو الخصم (لو في)\n\nوأنا هكتبلك 3 نسخ إعلانية مختلفة 🚀")
+        await context.bot.send_message(chat_id, f"✍️ تمام يا {leader}! اكتبيلي:\n\n1️⃣ اسم المنتج\n2️⃣ وصف بسيط\n3️⃣ السعر\n4️⃣ العرض أو الخصم (لو في)\n\nوأنا هكتبلك 3 نسخ إعلانية مختلفة 🚀")
         _record_bot_message(chat_id)
         # Set waiting state for ad copy
         context.chat_data["waiting_adcopy"] = True
@@ -1414,7 +1420,7 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # For analyze, creative, sheet, question - send prompt and set waiting state
         msg = loading_msgs.get(action, f"يا {leader}، قوليلي محتاجة إيه وأنا هساعدك!")
-        await query.message.reply_text(msg)
+        await context.bot.send_message(chat_id, msg)
         _record_bot_message(chat_id)
         # Set waiting state so next photo/text is treated as response to this request
         context.chat_data["help_waiting"] = {
