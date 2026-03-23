@@ -9,6 +9,8 @@ import json
 import asyncio
 import logging
 import time as _time_mod
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
@@ -241,8 +243,44 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await photo_file.download_to_memory(photo_bytes_io)
     photo_bytes = photo_bytes_io.getvalue()
 
-    # Quick check: is this work or personal?
+    # Check if this photo is a response to a help request (creative analysis, etc.)
     leader = analyzer.get_leader(team_name)
+    help_state = context.chat_data.get("help_waiting")
+    if help_state and help_state.get("team") == team_name:
+        action = help_state.get("action", "")
+        context.chat_data.pop("help_waiting", None)  # Clear state
+
+        if action == "creative":
+            await msg.reply_text(f"🎨 جاري تحليل الكريتيف يا {leader}... ⏳")
+            _record_bot_message(chat_id)
+            try:
+                analysis = await analyzer.analyze_creative(photo_bytes, team_name)
+                if analysis:
+                    await send_long_message(context, chat_id, analysis)
+                    analyzer.remember_exchange(team_name, analysis[:300])
+                else:
+                    await msg.reply_text(f"يا {leader}، مش قادر أحلل الصورة دي. جرّبي تاني.")
+            except Exception as e:
+                logger.error("Creative analysis error: %s", e)
+                await msg.reply_text(f"يا {leader}، حصل مشكلة. جرّبي تاني.")
+            return
+
+        elif action == "analyze":
+            await msg.reply_text(f"📊 جاري تحليل الأرقام يا {leader}... ⏳")
+            _record_bot_message(chat_id)
+            try:
+                analysis = await analyzer.analyze_screenshot(photo_bytes, team_name, "")
+                if analysis and analysis.get("smart_analysis"):
+                    await send_long_message(context, chat_id, analysis["smart_analysis"])
+                    analyzer.remember_exchange(team_name, analysis["smart_analysis"][:300])
+                else:
+                    await msg.reply_text(f"يا {leader}، مش قادر أقرأ الأرقام. جرّبي صورة أوضح.")
+            except Exception as e:
+                logger.error("Analyze error: %s", e)
+                await msg.reply_text(f"يا {leader}، حصل مشكلة. جرّبي تاني.")
+            return
+
+    # Quick check: is this work or personal?
     try:
         quick_check = await analyzer.quick_image_check(photo_bytes)
         if quick_check == "PERSONAL":
@@ -1335,10 +1373,17 @@ async def callback_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["waiting_adcopy"] = True
 
     else:
-        # For analyze, creative, sheet, question - send prompt and wait
+        # For analyze, creative, sheet, question - send prompt and set waiting state
         msg = loading_msgs.get(action, f"يا {leader}، قوليلي محتاجة إيه وأنا هساعدك!")
         await query.message.reply_text(msg)
         _record_bot_message(chat_id)
+        # Set waiting state so next photo/text is treated as response to this request
+        context.chat_data["help_waiting"] = {
+            "action": action,
+            "team": team_name,
+            "time": analyzer._now_egypt().isoformat(),
+        }
+        logger.info("Set help_waiting: %s for %s", action, team_name)
 
     # Record in DB
     analyzer.db_log_conversation(team_name, f"help_{action}", "")
@@ -1810,17 +1855,23 @@ async def _send_missing_reminder(context: ContextTypes.DEFAULT_TYPE, prefix: str
 
 async def final_morning_check(context: ContextTypes.DEFAULT_TYPE):
     """
-    12:00 PM - Final check:
-    1. Read tracking for each team
-    2. Read each team's Google Sheet
-    3. Trigger master sheet update
-    4. Send individual team reports to OWNER
-    5. Wait for owner decision on each team
+    12:00 PM - INTEGRATED FLOW:
+    Step 1: Check each team's sheet + tracking data
+    Step 2: Build report for owner with decisions
+    Step 3: Trigger master sheet update
+    Step 4: Run proactive analysis
+    Step 5: Generate smart daily report
+    ALL IN ONE CONNECTED FLOW
     """
-    # Trigger master sheet update
-    await analyzer.trigger_master_update()
+    await context.bot.send_message(
+        chat_id=OWNER_CHAT_ID,
+        text="⏳ جاري المراجعة الشاملة لكل الفرق..."
+    )
 
-    # Build and send reports for each team to owner
+    complete_teams = []
+    incomplete_teams = []
+
+    # Step 1: Check each team
     for team_name in analyzer.TEAM_INFO:
         gid = TEAM_GIDS.get(team_name)
         if not gid or gid in paused_teams:
@@ -1829,68 +1880,104 @@ async def final_morning_check(context: ContextTypes.DEFAULT_TYPE):
         try:
             report = await analyzer.build_owner_team_report(team_name)
 
-            # Only send to owner if there are missing items or issues
-            if not report["complete"] or report["cpo_status"] == "red":
-                text = _format_owner_team_report(team_name, gid, report)
-                keyboard = _build_owner_decision_keyboard(gid)
-                await context.bot.send_message(
-                    chat_id=OWNER_CHAT_ID,
-                    text=text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                )
+            if not report["complete"] or report.get("cpo_status") == "red":
+                incomplete_teams.append((team_name, gid, report))
             else:
-                # Team is complete - just notify briefly
-                leader = report["leader"]
-                sd = report.get("sheet_data", {})
-                cpo = sd.get("cpo")
-                cpo_str = f" CPO={cpo:.0f}" if cpo else ""
-                await context.bot.send_message(
-                    chat_id=OWNER_CHAT_ID,
-                    text=f"✅ {team_name} ({leader}): كل حاجة تمام.{cpo_str}",
-                )
+                complete_teams.append((team_name, gid, report))
         except Exception as e:
             logger.error("Final check failed for %s: %s", team_name, e)
+            incomplete_teams.append((team_name, gid, {"error": str(e), "complete": False, "leader": analyzer.get_leader(team_name)}))
+        await asyncio.sleep(0.3)
+
+    # Step 2: Send summary first
+    summary = f"📋 ملخص المراجعة - {analyzer._now_egypt().strftime('%H:%M %d/%m')}\n\n"
+    summary += f"✅ اكتمل: {len(complete_teams)} فريق\n"
+    summary += f"⚠️ ناقص: {len(incomplete_teams)} فريق\n\n"
+
+    if complete_teams:
+        summary += "── الفرق المكتملة ──\n"
+        for tn, gid, rpt in complete_teams:
+            leader = rpt.get("leader", "")
+            sd = rpt.get("sheet_data", {})
+            cpo = sd.get("cpo")
+            cpo_str = f" | CPO={cpo:.0f}" if cpo else ""
+            summary += f"✅ {tn} ({leader}){cpo_str}\n"
+
+    await context.bot.send_message(chat_id=OWNER_CHAT_ID, text=summary)
+
+    # Step 3: Send individual reports for incomplete teams
+    for team_name, gid, report in incomplete_teams:
+        try:
+            text = _format_owner_team_report(team_name, gid, report)
+            keyboard = _build_owner_decision_keyboard(gid)
             await context.bot.send_message(
                 chat_id=OWNER_CHAT_ID,
-                text=f"⚠️ {team_name}: خطأ في المراجعة - {e}",
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
             )
+        except Exception as e:
+            logger.error("Owner report failed for %s: %s", team_name, e)
         await asyncio.sleep(0.5)
 
+    # Step 4: Trigger master sheet update
+    logger.info("Flow Step 4: Updating master sheet...")
+    update_ok = await analyzer.trigger_master_update()
+    if update_ok:
+        logger.info("Master sheet updated successfully")
+    else:
+        logger.warning("Master sheet update failed or skipped")
 
-async def proactive_check(context: ContextTypes.DEFAULT_TYPE):
-    """1:30 PM - Proactive check after master update."""
+    # Step 5: Run proactive analysis
+    logger.info("Flow Step 5: Running proactive analysis...")
     alerts = await analyzer.proactive_sheet_check()
-    if not alerts:
-        return
-
-    # Group alerts by severity
-    critical = [a for a in alerts if a["severity"] == "critical"]
-    warnings = [a for a in alerts if a["severity"] == "warning"]
-
-    if critical or warnings:
-        parts = ["🔍 نتائج المراجعة الاستباقية:\n"]
-        for a in critical:
-            parts.append(f"🚨 {a['msg']}")
-        for a in warnings:
-            parts.append(f"⚠️ {a['msg']}")
-
-        try:
+    if alerts:
+        critical = [a for a in alerts if a["severity"] == "critical"]
+        warnings = [a for a in alerts if a["severity"] == "warning"]
+        if critical or warnings:
+            parts = ["\n🔍 نتائج المراجعة الاستباقية:\n"]
+            for a in critical:
+                parts.append(f"🚨 {a['msg']}")
+            for a in warnings:
+                parts.append(f"⚠️ {a['msg']}")
             await send_long_message(context, OWNER_CHAT_ID, "\n".join(parts))
-        except Exception as e:
-            logger.error("Proactive check send error: %s", e)
 
-
-async def smart_daily_report(context: ContextTypes.DEFAULT_TYPE):
-    """2:00 PM - Smart daily report to owner."""
-    report = await analyzer.generate_smart_daily_report()
-    if report:
+    # Step 6: Save daily performance to DB for all teams
+    logger.info("Flow Step 6: Saving daily performance to DB...")
+    for team_name in analyzer.TEAM_INFO:
         try:
+            rows = await analyzer.fetch_team_sheet(team_name)
+            today_row = analyzer.get_team_sheet_today(rows) if rows else None
+            if today_row:
+                analyzer.db_save_daily_performance(team_name, today_row)
+        except Exception as e:
+            logger.error("DB save failed for %s: %s", team_name, e)
+
+    # Step 7: Generate smart daily report
+    logger.info("Flow Step 7: Generating smart daily report...")
+    try:
+        report = await analyzer.generate_smart_daily_report()
+        if report:
             await send_long_message(
                 context, OWNER_CHAT_ID,
                 f"📊 التقرير اليومي الذكي:\n\n{report}",
             )
-        except Exception as e:
-            logger.error("Daily report send error: %s", e)
+    except Exception as e:
+        logger.error("Smart daily report failed: %s", e)
+
+    await context.bot.send_message(
+        chat_id=OWNER_CHAT_ID,
+        text="✅ تمت المراجعة الشاملة. الشيت المجمع متحدث والتقرير جاهز."
+    )
+
+
+async def proactive_check(context: ContextTypes.DEFAULT_TYPE):
+    """1:30 PM - Already done in final_morning_check flow. Just log."""
+    logger.info("Proactive check: skipped (already run in morning flow)")
+
+
+async def smart_daily_report(context: ContextTypes.DEFAULT_TYPE):
+    """2:00 PM - Already done in final_morning_check flow. Just log."""
+    logger.info("Smart daily report: skipped (already run in morning flow)")
 
 
 async def send_afternoon_questions(context: ContextTypes.DEFAULT_TYPE):
@@ -2301,5 +2388,39 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# HEALTH CHECK HTTP SERVER (port 8080)
+# ══════════════════════════════════════════════════════════════════════
+
+_bot_start_time = datetime.now()
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        uptime = (datetime.now() - _bot_start_time).total_seconds()
+        health = {
+            "status": "ok",
+            "uptime_seconds": int(uptime),
+            "uptime_human": f"{int(uptime//3600)}h {int((uptime%3600)//60)}m",
+            "bot": "EcoTeam Agent V2",
+            "version": "2.0",
+        }
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(health).encode())
+
+    def log_message(self, format, *args):
+        pass  # Suppress access logs
+
+def _start_health_server():
+    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
+    server.serve_forever()
+
+
 if __name__ == "__main__":
+    # Start health check server in background
+    health_thread = threading.Thread(target=_start_health_server, daemon=True)
+    health_thread.start()
+    logger.info("Health check server started on :8080")
+
     main()
