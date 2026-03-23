@@ -1778,8 +1778,18 @@ async def callback_pause_toggle(update: Update, context: ContextTypes.DEFAULT_TY
 # SCHEDULED JOBS
 # ══════════════════════════════════════════════════════════════════════
 
+_morning_pre_sent_today = ""
+_morning_sent_today = ""
+
 async def send_morning_prereminder(context: ContextTypes.DEFAULT_TYPE):
     """10:30 AM - Friendly morning reminder. Skip teams that already submitted."""
+    global _morning_pre_sent_today
+    today = analyzer._now_egypt().strftime("%Y-%m-%d")
+    if _morning_pre_sent_today == today:
+        logger.info("Morning pre-reminder already sent today, skipping")
+        return
+    _morning_pre_sent_today = today
+
     for gid, team_name in TEAMS.items():
         if gid in paused_teams:
             continue
@@ -1809,6 +1819,13 @@ async def send_morning_prereminder(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_smart_morning_reminder(context: ContextTypes.DEFAULT_TYPE):
     """11:00 AM - Deadline reached. Only remind teams with MISSING items."""
+    global _morning_sent_today
+    today = analyzer._now_egypt().strftime("%Y-%m-%d")
+    if _morning_sent_today == today:
+        logger.info("Morning reminder already sent today, skipping")
+        return
+    _morning_sent_today = today
+
     for gid, team_name in TEAMS.items():
         if gid in paused_teams:
             continue
@@ -2025,8 +2042,17 @@ async def smart_daily_report(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Smart daily report: skipped (already run in morning flow)")
 
 
+_afternoon_sent_today = ""
+
 async def send_afternoon_questions(context: ContextTypes.DEFAULT_TYPE):
     """4:00 PM - Send afternoon questions to each team + schedule follow-ups."""
+    global _afternoon_sent_today
+    today = analyzer._now_egypt().strftime("%Y-%m-%d")
+    if _afternoon_sent_today == today:
+        logger.info("Afternoon questions already sent today, skipping")
+        return
+    _afternoon_sent_today = today
+
     for gid, team_name in TEAMS.items():
         if gid in paused_teams:
             continue
