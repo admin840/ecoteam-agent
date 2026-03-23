@@ -958,6 +958,85 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             return
 
+    # Check if waiting for help response (user pressed a help button and now sends text)
+    help_state = context.chat_data.get("help_waiting")
+    if help_state and help_state.get("team") == team_name:
+        action = help_state.get("action", "")
+        leader = analyzer.get_leader(team_name)
+
+        # Check if user wants bot to read their sheet
+        sheet_keywords = ["الشيت", "شيت", "sheet", "شوف", "اقرأ", "بص"]
+        wants_sheet = any(kw in text for kw in sheet_keywords)
+
+        if action == "analyze" and wants_sheet:
+            # User wants bot to read the sheet itself
+            context.chat_data.pop("help_waiting", None)
+            await context.bot.send_message(chat_id, f"📊 تمام يا {leader}! خليني أقرأ الشيت... ⏳")
+            _record_bot_message(chat_id)
+            rows = await analyzer.fetch_team_sheet(team_name)
+            recent = analyzer.get_team_sheet_recent(rows, 7) if rows else []
+            data = f"بيانات {team_name} آخر 7 أيام:\n"
+            for r in recent:
+                data += f"- {r.get('Date','')}: Spend={r.get('Spend','0')} | Orders={r.get('New Orders','0')} | Del={r.get('Delivered','0')}\n"
+            analysis = await analyzer.analyze_text_message(team_name, f"حلل الأرقام دي:\n{data}", "")
+            if analysis:
+                await send_long_message(context, chat_id, analysis)
+            else:
+                await context.bot.send_message(chat_id, f"يا {leader}، مش قادر أحلل. جرّبي تاني.")
+            return
+
+        elif action == "adcopy":
+            # User sent product details for ad copy
+            context.chat_data.pop("help_waiting", None)
+            context.chat_data.pop("waiting_adcopy", None)
+            await context.bot.send_message(chat_id, f"✍️ جاري كتابة الإعلان يا {leader}... ⏳")
+            _record_bot_message(chat_id)
+            analysis = await analyzer.analyze_text_message(
+                team_name,
+                f"اكتب 3 نسخ إعلانية مختلفة لـ Facebook Messages Ads بناءً على:\n{text}\n\nكل نسخة لازم تكون: عنوان + نص + CTA. بالعربي الخليجي/المصري.",
+                ""
+            )
+            if analysis:
+                await send_long_message(context, chat_id, analysis)
+            else:
+                await context.bot.send_message(chat_id, f"يا {leader}، جرّبي تاني.")
+            return
+
+        elif action == "question":
+            # User asked a question
+            context.chat_data.pop("help_waiting", None)
+            await context.bot.send_message(chat_id, f"🤔 خليني أفكر يا {leader}... ⏳")
+            _record_bot_message(chat_id)
+            analysis = await analyzer.analyze_text_message(team_name, text, "")
+            if analysis:
+                await send_long_message(context, chat_id, analysis)
+            return
+
+        elif action == "analyze":
+            # User typed numbers directly
+            context.chat_data.pop("help_waiting", None)
+            await context.bot.send_message(chat_id, f"📊 جاري التحليل يا {leader}... ⏳")
+            _record_bot_message(chat_id)
+            analysis = await analyzer.analyze_text_message(
+                team_name,
+                f"التيم ليدر كتب الأرقام دي:\n{text}\n\nحلل الأرقام وقولي رأيك واقتراحاتك.",
+                ""
+            )
+            if analysis:
+                await send_long_message(context, chat_id, analysis)
+            else:
+                await context.bot.send_message(chat_id, f"يا {leader}، مش فاهم الأرقام. اكتبيهم بشكل واضح: spend=X orders=Y")
+            return
+
+        else:
+            # Generic: send to Claude
+            context.chat_data.pop("help_waiting", None)
+            analysis = await analyzer.analyze_text_message(team_name, text, "")
+            if analysis:
+                await send_long_message(context, chat_id, analysis)
+                _record_bot_message(chat_id)
+            return
+
     # Check if waiting for correction
     correction_state = context.chat_data.get("waiting_correction")
     if correction_state:
@@ -1058,6 +1137,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     leader = analyzer.get_leader(team_name)
+
+    # Clear help_waiting if set (document is the response)
+    help_state = context.chat_data.get("help_waiting")
+    if help_state:
+        context.chat_data.pop("help_waiting", None)
+        logger.info("Document received as help response for %s", help_state.get("action"))
+
     await msg.reply_text(f"⏳ جاري تحليل الملف يا {leader}...")
     _record_bot_message(chat_id)
 
