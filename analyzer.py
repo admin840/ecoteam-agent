@@ -41,7 +41,7 @@ def _now_egypt():
 
 
 # ── Config ────────────────────────────────────────────────────────────
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
+CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("CLAUDE_API_KEY", "")
 MASTER_SHEET_URL = os.environ.get("MASTER_SHEET_URL", "")
 TRACKING_SHEET_URL = "https://script.google.com/macros/s/AKfycbxorxOudJDqD_55pElkEEtGM16VutZg-vxMSMDHaBCnIK17H5jAOcK0gfr5bKcqIl-p6Q/exec"
 TRACKING_SHEET_ID = "1aKF2b3oRSkdvpybmmE_j1U34DVn6mpJSyjPp5btnBvg"
